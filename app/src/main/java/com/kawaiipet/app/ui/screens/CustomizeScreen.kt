@@ -12,7 +12,6 @@ import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -32,26 +31,17 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringArrayResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.ViewModel
-import androidx.lifecycle.viewModelScope
 import androidx.navigation.NavController
 import com.kawaiipet.app.R
-import com.kawaiipet.app.supabase.ProfileRepository
 import com.kawaiipet.app.util.PreferenceManager
-import com.kawaiipet.app.util.Analytics
 import dagger.hilt.android.lifecycle.HiltViewModel
-import io.github.jan.supabase.SupabaseClient
-import io.github.jan.supabase.auth.auth
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import javax.inject.Inject
 
 private val kittenVoiceOptions = listOf(0, 1, 2, 3)
@@ -59,8 +49,6 @@ private val kittenVoiceOptions = listOf(0, 1, 2, 3)
 @HiltViewModel
 class CustomizeViewModel @Inject constructor(
     private val prefs: PreferenceManager,
-    private val supabase: SupabaseClient,
-    private val profileRepository: ProfileRepository,
 ) : ViewModel() {
 
     val petName = prefs.petName
@@ -68,26 +56,10 @@ class CustomizeViewModel @Inject constructor(
     val ttsSpeakerId = prefs.ttsSpeakerId
     val ttsVolume = prefs.ttsVolume
 
-    val isSignedIn: Boolean
-        get() = supabase.auth.currentSessionOrNull() != null
-
     suspend fun setPetName(value: String) = prefs.setPetName(value)
     suspend fun setPersonality(value: String) = prefs.setPersonalityPrompt(value)
     suspend fun setSpeakerId(value: Int) = prefs.setTtsSpeakerId(value)
     suspend fun setVolume(value: Float) = prefs.setTtsVolume(value)
-
-    fun pushProfileToCloud(onResult: (Result<Unit>) -> Unit) {
-        viewModelScope.launch {
-            if (supabase.auth.currentSessionOrNull() == null) {
-                onResult(Result.failure(IllegalStateException("Not signed in")))
-                return@launch
-            }
-            val name = prefs.getPetName()
-            val p = prefs.personalityPrompt.first()
-            val r = profileRepository.upsertProfile(name, p)
-            withContext(Dispatchers.Main.immediate) { onResult(r) }
-        }
-    }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -106,9 +78,7 @@ fun CustomizeScreen(
     val personality = personalityEdit ?: personalitySaved
     val speakerId by viewModel.ttsSpeakerId.collectAsState(initial = 1)
     val volume by viewModel.ttsVolume.collectAsState(initial = 1f)
-    var syncMessage by remember { mutableStateOf<String?>(null) }
     val scope = rememberCoroutineScope()
-    val context = LocalContext.current
 
     Scaffold(
         topBar = {
@@ -207,49 +177,6 @@ fun CustomizeScreen(
                 onValueChange = { v -> scope.launch { viewModel.setVolume(v) } },
                 valueRange = 0f..1f,
             )
-
-            Spacer(modifier = Modifier.height(16.dp))
-
-            if (viewModel.isSignedIn) {
-                Button(
-                    onClick = {
-                        Analytics.capture(
-                            event = "pet customized",
-                            properties = mapOf(
-                                "has_custom_name" to petName.isNotBlank(),
-                                "has_custom_personality" to personality.isNotBlank(),
-                                "speaker_id" to speakerId,
-                                "volume_pct" to (volume * 100).toInt(),
-                            ),
-                        )
-                        viewModel.pushProfileToCloud { result ->
-                            result.onSuccess {
-                                Analytics.capture(event = "profile synced to cloud")
-                            }
-                            syncMessage = result.fold(
-                                onSuccess = { context.getString(R.string.profile_synced) },
-                                onFailure = {
-                                    it.message ?: context.getString(R.string.profile_sync_failed)
-                                },
-                            )
-                        }
-                    },
-                    modifier = Modifier.fillMaxWidth(),
-                ) {
-                    Text(stringResource(R.string.save_profile_to_cloud))
-                }
-            } else {
-                Text(
-                    text = stringResource(R.string.sign_in_to_sync_profile),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-
-            syncMessage?.let { msg ->
-                Spacer(modifier = Modifier.height(8.dp))
-                Text(text = msg, style = MaterialTheme.typography.bodySmall)
-            }
 
             Spacer(modifier = Modifier.height(24.dp))
         }

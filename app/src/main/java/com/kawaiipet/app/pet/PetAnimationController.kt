@@ -9,7 +9,7 @@ import javax.inject.Singleton
 @Singleton
 class PetAnimationController @Inject constructor() {
 
-    private val _expression = MutableStateFlow(PetExpression.IDLE)
+    private val _expression = MutableStateFlow(PetExpression.SLEEPING)
     val expression: StateFlow<PetExpression> = _expression.asStateFlow()
 
     private val _mouthOpen = MutableStateFlow(false)

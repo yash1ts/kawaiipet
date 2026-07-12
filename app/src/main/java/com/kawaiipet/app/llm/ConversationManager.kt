@@ -18,7 +18,19 @@ class ConversationManager @Inject constructor(
 ) {
     data class LlmResponse(val text: String, val expression: PetExpression)
 
-    suspend fun processUserInput(text: String): LlmResponse {
+    /** Fire while the user is still speaking so the model is warm when [processUserInput] runs. */
+    suspend fun warmUpLlm() {
+        llmService.warmUp()
+    }
+
+    /**
+     * [onPartial] receives display-ready partial text (emotion tags stripped) as the
+     * model streams, so the bubble can fill in before generation completes.
+     */
+    suspend fun processUserInput(
+        text: String,
+        onPartial: (String) -> Unit = {},
+    ): LlmResponse {
         shortTermMemory.addMessage(ChatMessage(Role.USER, text))
 
         val keywords = factMatcher.extractKeywords(text)
@@ -31,7 +43,10 @@ class ConversationManager @Inject constructor(
         val messages = shortTermMemory.getMessages()
         val factTexts = relevantFacts.map { it.factText }
 
-        val rawResponse = llmService.chat(messages, factTexts)
+        val rawResponse = llmService.chat(messages, factTexts) { partialRaw ->
+            val display = sanitizeForDisplay(partialRaw)
+            if (display.isNotEmpty()) onPartial(display)
+        }
         Log.d(
             TAG,
             "llm raw (${rawResponse.length} chars): ${rawResponse.toOneLineLog()}",
@@ -81,6 +96,16 @@ class ConversationManager @Inject constructor(
 
         private val EMOTION_TAG_REGEX = "\\[(happy|sad|angry|thinking|idle|listening|talking|sleeping)\\]"
             .toRegex(RegexOption.IGNORE_CASE)
+
+        /** A possibly-unfinished emotion tag at the end of streamed text, e.g. "…hi! [hap". */
+        private val TRAILING_PARTIAL_TAG_REGEX = "\\[[^\\]]*$".toRegex()
+
+        /** Strips complete emotion tags plus any partially generated trailing tag. */
+        fun sanitizeForDisplay(partialRaw: String): String =
+            partialRaw
+                .replace(EMOTION_TAG_REGEX, "")
+                .replace(TRAILING_PARTIAL_TAG_REGEX, "")
+                .trim()
 
         fun parseEmotionTag(response: String): Pair<String, PetExpression> {
             val match = EMOTION_TAG_REGEX.findAll(response).lastOrNull()

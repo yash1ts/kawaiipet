@@ -1,21 +1,19 @@
 [versions]
 agp = "8.7.3"
-kotlin = "2.0.21"
-ksp = "2.0.21-1.0.28"
+kotlin = "2.2.21"
+ksp = "2.2.21-2.0.5"
 composeBom = "2024.12.01"
-hilt = "2.52"
-room = "2.6.1"
+hilt = "2.58"
+room = "2.7.2"
 navigation = "2.8.5"
 datastore = "1.1.1"
 lifecycle = "2.8.7"
 lottie = "6.7.1"
 coroutines = "1.9.0"
-supabase = "3.1.0"
-ktor = "3.0.3"
-serialization = "1.7.3"
 activityCompose = "1.9.3"
 coreKtx = "1.15.0"
 posthog = "3.31.0"
+mlkitGenaiPrompt = "1.0.0-beta2"
 [libraries]
 compose-bom = { group = "androidx.compose", name = "compose-bom", version.ref = "composeBom" }
 compose-ui = { group = "androidx.compose.ui", name = "ui" }
@@ -51,16 +49,10 @@ lottie-compose = { group = "com.airbnb.android", name = "lottie-compose", versio
 
 posthog-android = { group = "com.posthog", name = "posthog-android", version.ref = "posthog" }
 
-supabase-bom = { group = "io.github.jan-tennert.supabase", name = "bom", version.ref = "supabase" }
-supabase-postgrest = { group = "io.github.jan-tennert.supabase", name = "postgrest-kt", version.ref = "supabase" }
-supabase-auth = { group = "io.github.jan-tennert.supabase", name = "auth-kt", version.ref = "supabase" }
-supabase-functions = { group = "io.github.jan-tennert.supabase", name = "functions-kt", version.ref = "supabase" }
-ktor-client-android = { group = "io.ktor", name = "ktor-client-android", version.ref = "ktor" }
-kotlinx-serialization-json = { group = "org.jetbrains.kotlinx", name = "kotlinx-serialization-json", version.ref = "serialization" }
+mlkit-genai-prompt = { group = "com.google.mlkit", name = "genai-prompt", version.ref = "mlkitGenaiPrompt" }
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }
 kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
 kotlin-compose = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }
 ksp = { id = "com.google.devtools.ksp", version.ref = "ksp" }
 hilt = { id = "com.google.dagger.hilt.android", version.ref = "hilt" }
-kotlin-serialization = { id = "org.jetbrains.kotlin.plugin.serialization", version.ref = "kotlin" }

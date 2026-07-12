@@ -37,6 +37,9 @@ class PreferenceManager(private val context: Context) {
 
     suspend fun getPetName(): String = petName.first()
 
+    suspend fun getPersonalityPrompt(): String =
+        personalityPrompt.first().ifBlank { DEFAULT_PERSONALITY }
+
     suspend fun getSttModelId(): String = sttModelId.first()
 
     suspend fun getTtsModelId(): String = ttsModelId.first()

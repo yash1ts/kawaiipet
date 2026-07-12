@@ -45,6 +45,7 @@ class PetViewModel(
 
     private var currentJob: Job? = null
     private var mouthAnimJob: Job? = null
+    private var warmUpJob: Job? = null
     private val emotionDurationMs = 2200L
 
     fun onPetTapped() {
@@ -57,6 +58,7 @@ class PetViewModel(
         if (_overlayState.value !is OverlayState.Idle) return
 
         uiFeedback.click()
+        warmUpLlmInBackground()
         currentJob?.cancel()
         currentJob = viewModelScope.launch {
             try {
@@ -145,6 +147,24 @@ class PetViewModel(
         }
     }
 
+    /**
+     * Loads Gemini Nano into memory while the user is still speaking, so inference
+     * can start the moment transcription finishes. Best-effort: failures are
+     * ignored and chat-time ensureReady() remains the authority.
+     */
+    private fun warmUpLlmInBackground() {
+        if (warmUpJob?.isActive == true) return
+        warmUpJob = viewModelScope.launch {
+            try {
+                conversationManager.warmUpLlm()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.d(TAG, "LLM warmup failed (will retry at chat time)", e)
+            }
+        }
+    }
+
     fun onTextSubmitted(text: String) {
         if (text.isBlank()) {
             _currentResponse.value = ""
@@ -169,7 +189,11 @@ class PetViewModel(
 
         try {
             val response = withTimeoutOrNull(LLM_TIMEOUT_MS) {
-                conversationManager.processUserInput(userText)
+                // Stream partial text into the bubble as the model generates
+                // (bubble is visible during Processing once text is non-empty).
+                conversationManager.processUserInput(userText) { partial ->
+                    _currentResponse.value = partial
+                }
             }
             if (response == null) {
                 Log.w(TAG, "processUserInput timed out after ${LLM_TIMEOUT_MS}ms")
@@ -192,17 +216,16 @@ class PetViewModel(
             val speakText = response.text.trim().ifBlank {
                 "Hmm, I'm here!"
             }
-            _currentResponse.value = ""
+            // Text already streamed into the bubble during Processing — show the
+            // final version immediately instead of re-revealing char by char.
+            _currentResponse.value = speakText
             animationController.setExpression(PetExpression.TALKING)
             _overlayState.value = OverlayState.Speaking(speakText)
             Log.d(TAG, "State → SPEAKING/TALKING")
 
             uiFeedback.petSpeakingStart()
             startMouthAnimation()
-            audioPipeline.speak(speakText) { partial ->
-                _currentResponse.value = partial
-            }
-            _currentResponse.value = speakText
+            audioPipeline.speak(speakText)
             stopMouthAnimation()
 
             animationController.setExpression(response.expression)
@@ -262,12 +285,13 @@ class PetViewModel(
         _currentResponse.value = ""
         _listeningSubtitle.value = ""
         _overlayState.value = OverlayState.Idle
-        animationController.setExpression(PetExpression.IDLE)
+        animationController.setExpression(PetExpression.SLEEPING)
     }
 
     fun cleanup() {
         currentJob?.cancel()
         mouthAnimJob?.cancel()
+        warmUpJob?.cancel()
         returnToIdle()
         audioPipeline.release()
     }

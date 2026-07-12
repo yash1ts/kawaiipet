@@ -46,6 +46,7 @@ class AudioPipeline(
     private var recordJob: Job? = null
     private val scope = CoroutineScope(Dispatchers.IO)
     private val sttInputCleaner = SttInputCleaner()
+    private val platformTts = PlatformTts(appContext)
 
     /** One-shot load of STT+TTS for the current pet session; see [schedulePetVoiceModelPrepare]. */
     private var petVoicePrepareJob: Job? = null
@@ -230,14 +231,15 @@ class AudioPipeline(
                     putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
                     putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, false)
                     putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
-                    // Longer pauses without cutting off a single utterance too aggressively.
+                    // Tolerate a short mid-sentence pause without dragging out end-of-speech
+                    // detection — this silence window delays every response.
                     putExtra(
                         RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS,
-                        2_000L
+                        1_200L
                     )
                     putExtra(
                         RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS,
-                        1_500L
+                        900L
                     )
                 }
 
@@ -365,6 +367,7 @@ class AudioPipeline(
 
     /**
      * Streams TTS audio (low latency: playback starts while later sentences synthesize).
+     * Falls back to Android [TextToSpeech] when Sherpa/Kitten models are not installed.
      * [onRevealed] runs in parallel with a bounded-time character ramp so the bubble animates without
      * blocking synthesis or playback.
      */
@@ -379,45 +382,71 @@ class AudioPipeline(
         if (!tts.isInitialized) {
             awaitPetVoiceEnginesReady(timeoutMs = 90_000L)
         }
-        if (!tts.isInitialized) {
-            Log.w(TAG, "speak skipped: TTS not ready after pet voice prepare")
-            return
-        }
 
         _state.value = PipelineState.SPEAKING
         val trimmed = text.trim()
-        val speakerId = preferenceManager.getTtsSpeakerId()
-        player.outputVolume = preferenceManager.getTtsVolume()
         try {
-            coroutineScope {
-                val channel = Channel<FloatArray>(capacity = 2)
-                val producer = launch(Dispatchers.Default) {
-                    try {
-                        for (sentence in SherpaTTS.splitIntoSentences(trimmed)) {
-                            val s = sentence.trim()
-                            if (s.isEmpty()) continue
-                            val samples = tts.generate(s, speakerId = speakerId)
-                            if (samples != null && samples.isNotEmpty()) {
-                                channel.send(samples)
-                            }
-                        }
-                    } finally {
-                        channel.close()
-                    }
-                }
-                val revealJob = launch {
-                    animateDialogueWhileSpeaking(trimmed, onRevealed)
-                }
-                val playbackJob = launch(Dispatchers.IO) {
-                    player.playStreaming(channel, tts.sampleRate)
-                }
-                producer.join()
-                playbackJob.join()
-                revealJob.cancelAndJoin()
-                onRevealed(trimmed)
+            if (tts.isInitialized) {
+                speakWithSherpa(trimmed, onRevealed)
+            } else {
+                Log.w(
+                    TAG,
+                    "Sherpa TTS not ready (no model in files/models). Falling back to platform TextToSpeech.",
+                )
+                speakWithPlatform(trimmed, onRevealed)
             }
         } finally {
             _state.value = PipelineState.IDLE
+        }
+    }
+
+    private suspend fun speakWithSherpa(
+        trimmed: String,
+        onRevealed: suspend (String) -> Unit,
+    ) {
+        val speakerId = preferenceManager.getTtsSpeakerId()
+        player.outputVolume = preferenceManager.getTtsVolume()
+        coroutineScope {
+            val channel = Channel<FloatArray>(capacity = 2)
+            val producer = launch(Dispatchers.Default) {
+                try {
+                    for (sentence in SherpaTTS.splitIntoSentences(trimmed)) {
+                        val s = sentence.trim()
+                        if (s.isEmpty()) continue
+                        val samples = tts.generate(s, speakerId = speakerId)
+                        if (samples != null && samples.isNotEmpty()) {
+                            channel.send(samples)
+                        }
+                    }
+                } finally {
+                    channel.close()
+                }
+            }
+            val revealJob = launch {
+                animateDialogueWhileSpeaking(trimmed, onRevealed)
+            }
+            val playbackJob = launch(Dispatchers.IO) {
+                player.playStreaming(channel, tts.sampleRate)
+            }
+            producer.join()
+            playbackJob.join()
+            revealJob.cancelAndJoin()
+            onRevealed(trimmed)
+        }
+    }
+
+    private suspend fun speakWithPlatform(
+        trimmed: String,
+        onRevealed: suspend (String) -> Unit,
+    ) = coroutineScope {
+        val revealJob = launch {
+            animateDialogueWhileSpeaking(trimmed, onRevealed)
+        }
+        val ok = platformTts.speak(trimmed)
+        revealJob.cancelAndJoin()
+        onRevealed(trimmed)
+        if (!ok) {
+            Log.e(TAG, "Platform TTS also failed — no voice output available")
         }
     }
 
@@ -446,6 +475,7 @@ class AudioPipeline(
 
     fun stopSpeaking() {
         player.stop()
+        platformTts.stop()
         _state.value = PipelineState.IDLE
     }
 
@@ -454,6 +484,7 @@ class AudioPipeline(
         petVoicePrepareJob = null
         recorder.release()
         player.release()
+        platformTts.release()
         stt.release()
         tts.release()
         _state.value = PipelineState.IDLE
@@ -490,7 +521,9 @@ class AudioPipeline(
 
         private const val SPEECH_THRESHOLD = 0.025f
         private const val MIN_SPEECH_FRAMES = 3
-        private const val SILENCE_CHUNKS_AFTER_SPEECH = 8
+
+        /** ~0.2s per chunk — 5 ≈ 1.0s of trailing silence before we stop listening. */
+        private const val SILENCE_CHUNKS_AFTER_SPEECH = 5
 
         /** ~0.2s per chunk at 16 kHz / 3200 samples — 50 ≈ 10s with no voiced audio. */
         private const val LEADING_SILENCE_CHUNKS = 50

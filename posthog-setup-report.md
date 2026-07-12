@@ -13,7 +13,7 @@ Users are identified (via `PostHog.identify`) on both sign-in and sign-up, linki
 | `user signed in` | User successfully authenticated with email/password | `app/src/main/java/com/kawaiipet/app/ui/auth/AuthEmailViewModel.kt` |
 | `user signed out` | User explicitly signed out of their account | `app/src/main/java/com/kawaiipet/app/ui/screens/SettingsScreen.kt` |
 | `pet started` | User successfully launched the pet overlay (all permissions granted) | `app/src/main/java/com/kawaiipet/app/ui/screens/HomeScreen.kt` |
-| `pet stopped` | Pet overlay service was destroyed (user dismissed or swiped away) | `app/src/main/java/com/kawaiipet/app/overlay/OverlayService.kt` |
+| `pet stopped` | Pet overlay service was destroyed (user dismissed or swiped away) | `app/src/main/java/com/kawaiipet/app/overlay/PetOverlayService.kt` |
 | `voice conversation initiated` | User tapped the pet to start a voice conversation | `app/src/main/java/com/kawaiipet/app/pet/PetViewModel.kt` |
 | `text conversation initiated` | User long-pressed the pet to open the text input overlay | `app/src/main/java/com/kawaiipet/app/pet/PetViewModel.kt` |
 | `ai response received` | Pet AI responded to user input; includes expression and response length | `app/src/main/java/com/kawaiipet/app/pet/PetViewModel.kt` |
@@ -30,7 +30,7 @@ Users are identified (via `PostHog.identify`) on both sign-in and sign-up, linki
 - `app/src/main/java/com/kawaiipet/app/ui/auth/AuthEmailViewModel.kt` — `user signed up`, `user signed in`, and `PostHog.identify`
 - `app/src/main/java/com/kawaiipet/app/ui/screens/SettingsScreen.kt` — `user signed out` and `PostHog.reset()`
 - `app/src/main/java/com/kawaiipet/app/ui/screens/HomeScreen.kt` — `pet started`
-- `app/src/main/java/com/kawaiipet/app/overlay/OverlayService.kt` — `pet stopped`
+- `app/src/main/java/com/kawaiipet/app/overlay/PetOverlayService.kt` — `pet stopped`
 - `app/src/main/java/com/kawaiipet/app/pet/PetViewModel.kt` — `voice conversation initiated`, `text conversation initiated`, `ai response received`
 - `app/src/main/java/com/kawaiipet/app/ui/screens/CustomizeScreen.kt` — `pet customized`, `profile synced to cloud`
 

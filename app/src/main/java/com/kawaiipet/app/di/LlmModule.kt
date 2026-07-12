@@ -1,7 +1,7 @@
 package com.kawaiipet.app.di
 
+import com.kawaiipet.app.llm.GeminiNanoLlmService
 import com.kawaiipet.app.llm.LlmService
-import com.kawaiipet.app.llm.SupabaseLlmService
 import dagger.Binds
 import dagger.Module
 import dagger.hilt.InstallIn
@@ -14,5 +14,5 @@ abstract class LlmModule {
 
     @Binds
     @Singleton
-    abstract fun bindLlmService(impl: SupabaseLlmService): LlmService
+    abstract fun bindLlmService(impl: GeminiNanoLlmService): LlmService
 }

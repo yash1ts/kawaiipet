@@ -46,8 +46,8 @@ private fun bubbleVisible(state: OverlayState, responseText: String): Boolean {
 /** Small composable tree for the pet-only overlay window (fixed size, does not grow with state). */
 @Composable
 fun OverlayPetWindowContent(
-    petViewModel: PetViewModel,
     animationController: PetAnimationController,
+    onTap: () -> Unit,
     onDrag: (Float, Float) -> Unit,
     onPetDragStart: () -> Unit = {},
     onPetDragEnd: () -> Unit = {},
@@ -56,7 +56,7 @@ fun OverlayPetWindowContent(
     KawaiiPetTheme(dynamicColor = false) {
         PetOverlay(
             animationController = animationController,
-            onTap = { petViewModel.onPetTapped() },
+            onTap = onTap,
             onDrag = onDrag,
             onDragStart = onPetDragStart,
             onDragEnd = onPetDragEnd,

@@ -21,9 +21,6 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
@@ -32,41 +29,36 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.navigation.NavController
 import com.kawaiipet.app.R
-import com.kawaiipet.app.util.Analytics
+import com.kawaiipet.app.llm.GeminiNanoAvailability
+import com.kawaiipet.app.llm.NanoAiState
 import dagger.hilt.android.lifecycle.HiltViewModel
-import io.github.jan.supabase.SupabaseClient
-import io.github.jan.supabase.auth.auth
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import javax.inject.Inject
 
 @HiltViewModel
 class SettingsViewModel @Inject constructor(
-    private val supabase: SupabaseClient,
+    private val nanoAvailability: GeminiNanoAvailability,
 ) : ViewModel() {
 
-    private val _signedInEmail = MutableStateFlow<String?>(null)
-    val signedInEmail: StateFlow<String?> = _signedInEmail.asStateFlow()
+    val nanoState = nanoAvailability.state
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), NanoAiState.Checking)
 
     init {
-        refreshSession()
+        refreshNanoStatus()
     }
 
-    fun refreshSession() {
-        _signedInEmail.value = supabase.auth.currentUserOrNull()?.email
-    }
-
-    fun signOut(onDone: () -> Unit) {
+    fun refreshNanoStatus() {
         viewModelScope.launch {
-            Analytics.capture(event = "user signed out")
-            runCatching { supabase.auth.signOut() }
-            Analytics.reset()
-            refreshSession()
-            withContext(Dispatchers.Main.immediate) { onDone() }
+            nanoAvailability.refreshStatus()
+        }
+    }
+
+    fun downloadNanoModel() {
+        viewModelScope.launch {
+            runCatching { nanoAvailability.download() }
+                .onFailure { nanoAvailability.refreshStatus() }
         }
     }
 }
@@ -75,11 +67,9 @@ class SettingsViewModel @Inject constructor(
 @Composable
 fun SettingsScreen(
     navController: NavController,
-    onSignedOut: () -> Unit,
     viewModel: SettingsViewModel = hiltViewModel(),
 ) {
-    val signedInEmail by viewModel.signedInEmail.collectAsState()
-    var errorText by remember { mutableStateOf<String?>(null) }
+    val nanoState by viewModel.nanoState.collectAsState()
 
     Scaffold(
         topBar = {
@@ -103,35 +93,45 @@ fun SettingsScreen(
             Spacer(modifier = Modifier.height(8.dp))
 
             Text(
-                text = stringResource(R.string.settings_account_section),
+                text = stringResource(R.string.settings_on_device_ai_section),
                 style = MaterialTheme.typography.titleMedium,
             )
             Spacer(modifier = Modifier.height(8.dp))
             Text(
-                text = stringResource(R.string.signed_in_as, signedInEmail ?: "—"),
+                text = when (val s = nanoState) {
+                    NanoAiState.Checking -> stringResource(R.string.nano_status_checking)
+                    NanoAiState.Available -> stringResource(R.string.nano_status_ready)
+                    NanoAiState.Downloadable -> stringResource(R.string.nano_status_downloadable)
+                    NanoAiState.Downloading -> stringResource(R.string.nano_status_downloading)
+                    is NanoAiState.DownloadProgress -> stringResource(
+                        R.string.nano_status_download_progress,
+                        s.bytesDownloaded,
+                    )
+                    NanoAiState.Unavailable -> stringResource(R.string.nano_status_unavailable)
+                    is NanoAiState.Failed -> stringResource(R.string.nano_status_failed, s.message)
+                },
                 style = MaterialTheme.typography.bodyLarge,
             )
-            Spacer(modifier = Modifier.height(24.dp))
-
-            OutlinedButton(
-                onClick = {
-                    errorText = null
-                    viewModel.signOut {
-                        onSignedOut()
+            when (nanoState) {
+                NanoAiState.Downloadable -> {
+                    Spacer(modifier = Modifier.height(8.dp))
+                    OutlinedButton(
+                        onClick = { viewModel.downloadNanoModel() },
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text(stringResource(R.string.nano_download_action))
                     }
-                },
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                Text(stringResource(R.string.sign_out))
-            }
-
-            errorText?.let { err ->
-                Spacer(modifier = Modifier.height(12.dp))
-                Text(
-                    text = err,
-                    color = MaterialTheme.colorScheme.error,
-                    style = MaterialTheme.typography.bodySmall,
-                )
+                }
+                NanoAiState.Unavailable, is NanoAiState.Failed -> {
+                    Spacer(modifier = Modifier.height(8.dp))
+                    OutlinedButton(
+                        onClick = { viewModel.refreshNanoStatus() },
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text(stringResource(R.string.nano_refresh_status))
+                    }
+                }
+                else -> Unit
             }
 
             Spacer(modifier = Modifier.height(24.dp))

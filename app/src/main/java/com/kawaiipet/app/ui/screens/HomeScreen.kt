@@ -2,6 +2,7 @@ package com.kawaiipet.app.ui.screens
 
 import android.Manifest
 import android.content.Intent
+import android.net.Uri
 import android.os.Build
 import android.view.HapticFeedbackConstants
 import android.view.SoundEffectConstants
@@ -30,6 +31,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -54,7 +56,9 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.navigation.NavController
 import com.kawaiipet.app.R
-import com.kawaiipet.app.overlay.OverlayService
+import com.kawaiipet.app.llm.NanoAiState
+import com.kawaiipet.app.overlay.PetOverlayService
+import com.kawaiipet.app.ui.HomeViewModel
 import com.kawaiipet.app.ui.StartPetRequestViewModel
 import com.kawaiipet.app.ui.components.SlimeSvgImage
 import com.kawaiipet.app.ui.navigation.Routes
@@ -62,7 +66,10 @@ import com.kawaiipet.app.util.PermissionHelper
 import com.kawaiipet.app.util.Analytics
 
 @Composable
-fun HomeScreen(navController: NavController) {
+fun HomeScreen(
+    navController: NavController,
+    homeViewModel: HomeViewModel = hiltViewModel(),
+) {
     val context = LocalContext.current
     val view = LocalView.current
     val activity = context as ComponentActivity
@@ -73,6 +80,8 @@ fun HomeScreen(navController: NavController) {
     }
     val startPetRequestViewModel: StartPetRequestViewModel = hiltViewModel(activity)
     val startPetRequested by startPetRequestViewModel.startPetRequested.collectAsStateWithLifecycle()
+    val nanoState by homeViewModel.nanoState.collectAsStateWithLifecycle()
+    val nanoReady = nanoState is NanoAiState.Available
     var hasOverlay by remember { mutableStateOf(PermissionHelper.hasOverlayPermission(context)) }
     var hasMic by remember { mutableStateOf(PermissionHelper.hasMicrophonePermission(context)) }
     var hasNotif by remember { mutableStateOf(PermissionHelper.hasNotificationPermission(context)) }
@@ -87,10 +96,10 @@ fun HomeScreen(navController: NavController) {
         }
         hasMic = PermissionHelper.hasMicrophonePermission(context)
         hasNotif = PermissionHelper.hasNotificationPermission(context)
-        if (pendingStartPet && hasOverlay && hasMic) {
+        if (pendingStartPet && hasOverlay && hasMic && homeViewModel.canStartPetWithNano()) {
             pendingStartPet = false
             Analytics.capture(event = "pet started")
-            context.startForegroundService(Intent(context, OverlayService::class.java))
+            context.startForegroundService(Intent(context, PetOverlayService::class.java))
         } else if (pendingStartPet && !hasMic) {
             pendingStartPet = false
         }
@@ -103,6 +112,7 @@ fun HomeScreen(navController: NavController) {
                 hasOverlay = PermissionHelper.hasOverlayPermission(context)
                 hasMic = PermissionHelper.hasMicrophonePermission(context)
                 hasNotif = PermissionHelper.hasNotificationPermission(context)
+                homeViewModel.refreshNanoStatus()
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
@@ -118,12 +128,13 @@ fun HomeScreen(navController: NavController) {
 
     fun tryStartPet() {
         when {
+            !nanoReady -> return
             !hasOverlay -> context.startActivity(PermissionHelper.createOverlayPermissionIntent(context))
             !hasMic || (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && !hasNotif) -> {
                 val need = permissionsToRequest()
                 if (need.isEmpty()) {
                     Analytics.capture(event = "pet started")
-                    context.startForegroundService(Intent(context, OverlayService::class.java))
+                    context.startForegroundService(Intent(context, PetOverlayService::class.java))
                     return
                 }
                 pendingStartPet = true
@@ -131,7 +142,7 @@ fun HomeScreen(navController: NavController) {
             }
             else -> {
                 Analytics.capture(event = "pet started")
-                context.startForegroundService(Intent(context, OverlayService::class.java))
+                context.startForegroundService(Intent(context, PetOverlayService::class.java))
             }
         }
     }
@@ -177,11 +188,26 @@ fun HomeScreen(navController: NavController) {
 
             Spacer(modifier = Modifier.height(48.dp))
 
+            NanoAiStatusSection(
+                nanoState = nanoState,
+                onDownload = {
+                    feedbackTap()
+                    homeViewModel.downloadNanoModel()
+                },
+                onRefresh = {
+                    feedbackTap()
+                    homeViewModel.refreshNanoStatus()
+                },
+            )
+
+            Spacer(modifier = Modifier.height(16.dp))
+
             Button(
                 onClick = {
                     feedbackTap()
                     tryStartPet()
                 },
+                enabled = nanoReady,
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(56.dp),
@@ -201,6 +227,7 @@ fun HomeScreen(navController: NavController) {
                 Spacer(modifier = Modifier.size(8.dp))
                 Text(
                     text = when {
+                        !nanoReady -> stringResource(R.string.nano_start_pet_disabled)
                         !hasOverlay -> "Grant Overlay Permission"
                         !hasMic || (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && !hasNotif) ->
                             "Grant Mic & Notifications"
@@ -218,6 +245,40 @@ fun HomeScreen(navController: NavController) {
                     color = MaterialTheme.colorScheme.error,
                     textAlign = TextAlign.Center
                 )
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        text = stringResource(R.string.overlay_restricted_settings_hint),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        textAlign = TextAlign.Center
+                    )
+                    Spacer(modifier = Modifier.height(4.dp))
+                    TextButton(
+                        onClick = {
+                            feedbackTap()
+                            context.startActivity(
+                                Intent(
+                                    Intent.ACTION_VIEW,
+                                    Uri.parse(context.getString(R.string.overlay_restricted_settings_help_url)),
+                                ),
+                            )
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text(stringResource(R.string.overlay_restricted_settings_help_learn_more))
+                    }
+                    Spacer(modifier = Modifier.height(4.dp))
+                    OutlinedButton(
+                        onClick = {
+                            feedbackTap()
+                            context.startActivity(PermissionHelper.createAppDetailsIntent(context))
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text(stringResource(R.string.overlay_open_app_info))
+                    }
+                }
             }
 
             if (hasOverlay && !hasMic) {
@@ -293,5 +354,51 @@ fun HomeScreen(navController: NavController) {
             }
 
         }
+    }
+}
+
+@Composable
+private fun NanoAiStatusSection(
+    nanoState: NanoAiState,
+    onDownload: () -> Unit,
+    onRefresh: () -> Unit,
+) {
+    val statusText = when (nanoState) {
+        NanoAiState.Checking -> stringResource(R.string.nano_status_checking)
+        NanoAiState.Available -> stringResource(R.string.nano_status_ready)
+        NanoAiState.Downloadable -> stringResource(R.string.nano_status_downloadable)
+        NanoAiState.Downloading -> stringResource(R.string.nano_status_downloading)
+        is NanoAiState.DownloadProgress -> stringResource(
+            R.string.nano_status_download_progress,
+            nanoState.bytesDownloaded,
+        )
+        NanoAiState.Unavailable -> stringResource(R.string.nano_status_unavailable)
+        is NanoAiState.Failed -> stringResource(R.string.nano_status_failed, nanoState.message)
+    }
+    Text(
+        text = statusText,
+        style = MaterialTheme.typography.bodySmall,
+        color = when (nanoState) {
+            NanoAiState.Available -> MaterialTheme.colorScheme.primary
+            NanoAiState.Unavailable, is NanoAiState.Failed -> MaterialTheme.colorScheme.error
+            else -> MaterialTheme.colorScheme.onSurfaceVariant
+        },
+        textAlign = TextAlign.Center,
+        modifier = Modifier.fillMaxWidth(),
+    )
+    when (nanoState) {
+        NanoAiState.Downloadable -> {
+            Spacer(modifier = Modifier.height(8.dp))
+            OutlinedButton(onClick = onDownload, modifier = Modifier.fillMaxWidth()) {
+                Text(stringResource(R.string.nano_download_action))
+            }
+        }
+        NanoAiState.Unavailable, is NanoAiState.Failed -> {
+            Spacer(modifier = Modifier.height(8.dp))
+            TextButton(onClick = onRefresh, modifier = Modifier.fillMaxWidth()) {
+                Text(stringResource(R.string.nano_refresh_status))
+            }
+        }
+        else -> Unit
     }
 }

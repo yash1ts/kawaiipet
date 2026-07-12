@@ -4,7 +4,7 @@ import android.content.Context
 import android.content.Intent
 import android.os.Build
 import androidx.core.content.ContextCompat
-import com.kawaiipet.app.overlay.OverlayService
+import com.kawaiipet.app.overlay.PetOverlayService
 import com.kawaiipet.app.ui.MainActivity
 
 /**
@@ -41,7 +41,7 @@ object PetLauncher {
                 Analytics.capture(event = "pet started")
                 ContextCompat.startForegroundService(
                     app,
-                    Intent(app, OverlayService::class.java),
+                    Intent(app, PetOverlayService::class.java),
                 )
             }
         }

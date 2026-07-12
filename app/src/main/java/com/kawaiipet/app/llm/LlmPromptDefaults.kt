@@ -1,8 +1,7 @@
 package com.kawaiipet.app.llm
 
 /**
- * Default chat instructions. Keep in sync with [supabase/functions/chat/index.ts]
- * (`DEFAULT_PERSONALITY` and the tail of `buildSystemPrompt`).
+ * Default chat instructions used by on-device Gemini Nano.
  */
 object LlmPromptDefaults {
 
