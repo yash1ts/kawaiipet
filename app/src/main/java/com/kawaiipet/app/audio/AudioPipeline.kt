@@ -14,6 +14,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.channels.ReceiveChannel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -35,7 +36,7 @@ enum class PipelineState { IDLE, LISTENING, PROCESSING, SPEAKING }
 class AudioPipeline(
     private val appContext: Context,
     private val stt: SherpaSTT,
-    private val tts: SherpaTTS,
+    private val tts: PiperPlusTts,
     private val recorder: AudioRecordManager,
     private val player: AudioTrackManager,
     private val preferenceManager: PreferenceManager,
@@ -46,7 +47,6 @@ class AudioPipeline(
     private var recordJob: Job? = null
     private val scope = CoroutineScope(Dispatchers.IO)
     private val sttInputCleaner = SttInputCleaner()
-    private val platformTts = PlatformTts(appContext)
 
     /** One-shot load of STT+TTS for the current pet session; see [schedulePetVoiceModelPrepare]. */
     private var petVoicePrepareJob: Job? = null
@@ -366,104 +366,82 @@ class AudioPipeline(
     }
 
     /**
-     * Streams TTS audio (low latency: playback starts while later sentences synthesize).
-     * Falls back to Android [TextToSpeech] when Sherpa/Kitten models are not installed.
-     * [onRevealed] runs in parallel with a bounded-time character ramp so the bubble animates without
-     * blocking synthesis or playback.
+     * Streams TTS: synthesizes each sentence as it arrives on [sentences] and plays
+     * audio as soon as the first chunk is ready (native piper-plus only).
      */
-    suspend fun speak(
-        text: String,
-        onRevealed: suspend (String) -> Unit = {}
-    ) {
-        if (text.isBlank()) {
-            Log.w(TAG, "speak skipped: blank text")
-            return
-        }
+    suspend fun speakSentences(sentences: ReceiveChannel<String>) {
         if (!tts.isInitialized) {
             awaitPetVoiceEnginesReady(timeoutMs = 90_000L)
         }
+        if (!tts.isInitialized) {
+            Log.e(TAG, "piper-plus TTS not ready — skipping speak (no system fallback)")
+            for (ignored in sentences) { /* drain */ }
+            return
+        }
 
         _state.value = PipelineState.SPEAKING
-        val trimmed = text.trim()
+        player.outputVolume = preferenceManager.getTtsVolume()
         try {
-            if (tts.isInitialized) {
-                speakWithSherpa(trimmed, onRevealed)
-            } else {
-                Log.w(
-                    TAG,
-                    "Sherpa TTS not ready (no model in files/models). Falling back to platform TextToSpeech.",
-                )
-                speakWithPlatform(trimmed, onRevealed)
+            coroutineScope {
+                val pcm = Channel<FloatArray>(capacity = 4)
+                val playbackJob = launch(Dispatchers.IO) {
+                    player.playStreaming(pcm, tts.sampleRate)
+                }
+                val producer = launch(Dispatchers.Default) {
+                    try {
+                        var index = 0
+                        val t0 = SystemClock.elapsedRealtime()
+                        for (sentence in sentences) {
+                            val piece = sentence.trim()
+                            if (piece.isEmpty()) continue
+                            val samples = tts.generate(piece) ?: continue
+                            if (samples.isEmpty()) continue
+                            if (index == 0) {
+                                Log.i(
+                                    TAG,
+                                    "piper-plus first audio chunk after " +
+                                        "${SystemClock.elapsedRealtime() - t0}ms " +
+                                        "(streaming with LLM)",
+                                )
+                            }
+                            index++
+                            pcm.send(samples)
+                        }
+                        Log.i(TAG, "piper-plus spoke $index sentence(s)")
+                    } finally {
+                        pcm.close()
+                    }
+                }
+                producer.join()
+                playbackJob.join()
             }
         } finally {
             _state.value = PipelineState.IDLE
         }
     }
 
-    private suspend fun speakWithSherpa(
-        trimmed: String,
-        onRevealed: suspend (String) -> Unit,
-    ) {
-        val speakerId = preferenceManager.getTtsSpeakerId()
-        player.outputVolume = preferenceManager.getTtsVolume()
+    /**
+     * One-shot speak of a full string (splits into sentences internally).
+     * Native piper-plus only — no system TTS fallback.
+     */
+    suspend fun speak(text: String) {
+        if (text.isBlank()) {
+            Log.w(TAG, "speak skipped: blank text")
+            return
+        }
+        val channel = Channel<String>(capacity = Channel.UNLIMITED)
         coroutineScope {
-            val channel = Channel<FloatArray>(capacity = 2)
-            val producer = launch(Dispatchers.Default) {
+            launch {
                 try {
-                    for (sentence in SherpaTTS.splitIntoSentences(trimmed)) {
-                        val s = sentence.trim()
-                        if (s.isEmpty()) continue
-                        val samples = tts.generate(s, speakerId = speakerId)
-                        if (samples != null && samples.isNotEmpty()) {
-                            channel.send(samples)
-                        }
+                    for (s in PiperPlusTts.splitIntoSentences(text.trim())) {
+                        channel.send(s)
                     }
                 } finally {
                     channel.close()
                 }
             }
-            val revealJob = launch {
-                animateDialogueWhileSpeaking(trimmed, onRevealed)
-            }
-            val playbackJob = launch(Dispatchers.IO) {
-                player.playStreaming(channel, tts.sampleRate)
-            }
-            producer.join()
-            playbackJob.join()
-            revealJob.cancelAndJoin()
-            onRevealed(trimmed)
+            speakSentences(channel)
         }
-    }
-
-    private suspend fun speakWithPlatform(
-        trimmed: String,
-        onRevealed: suspend (String) -> Unit,
-    ) = coroutineScope {
-        val revealJob = launch {
-            animateDialogueWhileSpeaking(trimmed, onRevealed)
-        }
-        val ok = platformTts.speak(trimmed)
-        revealJob.cancelAndJoin()
-        onRevealed(trimmed)
-        if (!ok) {
-            Log.e(TAG, "Platform TTS also failed — no voice output available")
-        }
-    }
-
-    private suspend fun animateDialogueWhileSpeaking(
-        fullText: String,
-        onRevealed: suspend (String) -> Unit
-    ) {
-        if (fullText.isEmpty()) return
-        val totalMs = (fullText.length * DIALOGUE_MS_PER_CHAR)
-            .coerceIn(MIN_DIALOGUE_TOTAL_MS, MAX_DIALOGUE_TOTAL_MS)
-        val ticks = (totalMs / REVEAL_TICK_MS).toInt().coerceAtLeast(3)
-        for (t in 1..ticks) {
-            val n = (t * fullText.length / ticks).coerceIn(0, fullText.length)
-            onRevealed(fullText.take(n))
-            delay(REVEAL_TICK_MS)
-        }
-        onRevealed(fullText)
     }
 
     fun stopListening() {
@@ -475,7 +453,6 @@ class AudioPipeline(
 
     fun stopSpeaking() {
         player.stop()
-        platformTts.stop()
         _state.value = PipelineState.IDLE
     }
 
@@ -484,7 +461,6 @@ class AudioPipeline(
         petVoicePrepareJob = null
         recorder.release()
         player.release()
-        platformTts.release()
         stt.release()
         tts.release()
         _state.value = PipelineState.IDLE
@@ -530,10 +506,5 @@ class AudioPipeline(
 
         /** Hard stop after speech energy was seen (handles constant background noise above threshold). */
         private const val MAX_UTTERANCE_AFTER_SPEECH_MS = 28_000L
-
-        private const val REVEAL_TICK_MS = 36L
-        private const val DIALOGUE_MS_PER_CHAR = 16L
-        private const val MIN_DIALOGUE_TOTAL_MS = 200L
-        private const val MAX_DIALOGUE_TOTAL_MS = 4_800L
     }
 }

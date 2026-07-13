@@ -6,5 +6,12 @@ package com.kawaiipet.app.audio
  */
 object DefaultVoiceModels {
     const val STT_MODEL_ID = "moonshine-tiny-en-quantized"
-    const val TTS_MODEL_ID = "kitten-nano-en-v0_2-fp16"
+
+    /**
+     * Native piper-plus voice. Expected on-disk layout:
+     *   files/models/piper-en_US-amy-medium/
+     *     en_US-amy-medium.onnx
+     *     en_US-amy-medium.onnx.json
+     */
+    const val TTS_MODEL_ID = "piper-en_US-amy-medium"
 }

@@ -5,6 +5,7 @@ import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.kawaiipet.app.audio.AudioPipeline
+import com.kawaiipet.app.audio.SentenceEmitBuffer
 import com.kawaiipet.app.llm.ConversationManager
 import com.kawaiipet.app.audio.ModelManager
 import com.kawaiipet.app.overlay.OverlayState
@@ -16,12 +17,14 @@ import kotlinx.coroutines.CancellationException
 import java.io.FileNotFoundException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 
 class PetViewModel(
@@ -188,13 +191,53 @@ class PetViewModel(
         Log.d(TAG, "State → PROCESSING/THINKING")
 
         try {
+            // Speak each completed LLM sentence as it streams — don't wait for the full reply.
+            val sentenceCh = Channel<String>(capacity = Channel.UNLIMITED)
+            val sentenceBuffer = SentenceEmitBuffer()
+            var talkingStarted = false
+
+            fun startTalkingUi() {
+                if (talkingStarted) return
+                talkingStarted = true
+                animationController.setExpression(PetExpression.TALKING)
+                _overlayState.value = OverlayState.Speaking(_currentResponse.value)
+                Log.d(TAG, "State → SPEAKING/TALKING (first sentence ready)")
+                uiFeedback.petSpeakingStart()
+                startMouthAnimation()
+            }
+
             val response = withTimeoutOrNull(LLM_TIMEOUT_MS) {
-                // Stream partial text into the bubble as the model generates
-                // (bubble is visible during Processing once text is non-empty).
-                conversationManager.processUserInput(userText) { partial ->
-                    _currentResponse.value = partial
+                coroutineScope {
+                    val speakJob = launch {
+                        audioPipeline.speakSentences(sentenceCh)
+                    }
+                    try {
+                        val llmResponse = conversationManager.processUserInput(userText) { partial ->
+                            _currentResponse.value = partial
+                            if (talkingStarted) {
+                                _overlayState.value = OverlayState.Speaking(partial)
+                            }
+                            for (sentence in sentenceBuffer.onPartial(partial)) {
+                                startTalkingUi()
+                                sentenceCh.trySend(sentence)
+                            }
+                        }
+                        val speakText = llmResponse.text.trim().ifBlank { "Hmm, I'm here!" }
+                        _currentResponse.value = speakText
+                        for (sentence in sentenceBuffer.finish(speakText)) {
+                            startTalkingUi()
+                            sentenceCh.trySend(sentence)
+                        }
+                        llmResponse
+                    } finally {
+                        sentenceCh.close()
+                        speakJob.join()
+                    }
                 }
             }
+
+            stopMouthAnimation()
+
             if (response == null) {
                 Log.w(TAG, "processUserInput timed out after ${LLM_TIMEOUT_MS}ms")
                 _currentResponse.value =
@@ -206,6 +249,7 @@ class PetViewModel(
                 returnToIdle()
                 return
             }
+
             Analytics.capture(
                 event = "ai response received",
                 properties = mapOf(
@@ -213,20 +257,17 @@ class PetViewModel(
                     "response_length" to response.text.length,
                 ),
             )
-            val speakText = response.text.trim().ifBlank {
-                "Hmm, I'm here!"
-            }
-            // Text already streamed into the bubble during Processing — show the
-            // final version immediately instead of re-revealing char by char.
-            _currentResponse.value = speakText
-            animationController.setExpression(PetExpression.TALKING)
-            _overlayState.value = OverlayState.Speaking(speakText)
-            Log.d(TAG, "State → SPEAKING/TALKING")
 
-            uiFeedback.petSpeakingStart()
-            startMouthAnimation()
-            audioPipeline.speak(speakText)
-            stopMouthAnimation()
+            if (!talkingStarted) {
+                // No sentence punctuation arrived — speak whatever we have as one shot.
+                val speakText = response.text.trim().ifBlank { "Hmm, I'm here!" }
+                _currentResponse.value = speakText
+                _overlayState.value = OverlayState.Speaking(speakText)
+                animationController.setExpression(PetExpression.TALKING)
+                startMouthAnimation()
+                audioPipeline.speak(speakText)
+                stopMouthAnimation()
+            }
 
             animationController.setExpression(response.expression)
             if (response.expression == PetExpression.HAPPY) {
@@ -239,6 +280,7 @@ class PetViewModel(
             throw e
         } catch (e: FileNotFoundException) {
             Log.e(TAG, "processText failed (missing file)", e)
+            stopMouthAnimation()
             _currentResponse.value =
                 "A file is missing. Check Logcat tag PetViewModel. [sad]"
             animationController.setExpression(PetExpression.SAD)
@@ -247,6 +289,7 @@ class PetViewModel(
             delay(emotionDurationMs)
         } catch (e: Exception) {
             Log.e(TAG, "processText failed", e)
+            stopMouthAnimation()
             val tail = e.message?.trim()?.replace('\n', ' ')?.take(90)
             _currentResponse.value = if (tail.isNullOrBlank()) {
                 "Something went wrong… See Logcat PetViewModel for the error. [sad]"

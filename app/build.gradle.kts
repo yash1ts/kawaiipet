@@ -104,6 +104,13 @@ android {
         noCompress += listOf("onnx", "ort")
     }
 
+    packaging {
+        jniLibs {
+            // 16 KB page-size compatibility (Android 15+); piper-plus .so are aligned.
+            useLegacyPackaging = false
+        }
+    }
+
 }
 
 // Sherpa-ONNX AAR bundles libonnxruntime.so per ABI; we repack the AAR as-is (no second ORT dependency).
@@ -189,6 +196,11 @@ dependencies {
     implementation(libs.lottie.compose)
 
     implementation(files(sherpaOnnxAppAarFile.asFile))
+
+    // Native piper-plus neural TTS (arm64-v8a only). Reuses the onnxruntime.so
+    // shipped by the Sherpa AAR (ORT 1.23.2 is backward-compatible with the
+    // 1.20.0 piper was built against), so this AAR ships without its own ORT.
+    implementation(files(layout.projectDirectory.file("libs/piper-plus-release.aar")))
 
     implementation(libs.posthog.android)
 

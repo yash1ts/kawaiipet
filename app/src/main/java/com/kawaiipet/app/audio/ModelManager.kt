@@ -11,6 +11,45 @@ class ModelManager(private val context: Context) {
 
     fun getModelDir(modelId: String): File = File(modelsDir, modelId)
 
+    /**
+     * Copies any voice model bundled under `assets/models/<id>/` into
+     * `files/models/<id>/` exactly once. Idempotent (guarded by a marker file)
+     * and safe to call from multiple threads. Call before checking
+     * [isModelDownloaded] so bundled voices work with no adb push.
+     */
+    fun installBundledModelsIfNeeded() = synchronized(installLock) {
+        val ids = runCatching { context.assets.list(ASSET_MODELS_DIR) }.getOrNull() ?: return
+        for (id in ids) {
+            val destDir = getModelDir(id)
+            val assetDir = "$ASSET_MODELS_DIR/$id"
+            val entries = runCatching { context.assets.list(assetDir) }.getOrNull().orEmpty()
+            if (entries.isEmpty()) continue
+
+            // Copy any missing bundled files even when a prior install marker
+            // exists (e.g. cmudict added after first install).
+            val missing = entries.filter { name -> !File(destDir, name).isFile }
+            if (missing.isEmpty() && File(destDir, MARKER_FILE).exists()) continue
+
+            destDir.mkdirs()
+            var ok = true
+            val toCopy = if (File(destDir, MARKER_FILE).exists()) missing else entries.toList()
+            for (name in toCopy) {
+                try {
+                    context.assets.open("$assetDir/$name").use { input ->
+                        File(destDir, name).outputStream().use { out -> input.copyTo(out) }
+                    }
+                } catch (e: Exception) {
+                    ok = false
+                    Log.e(TAG, "Failed copying bundled model asset $assetDir/$name", e)
+                }
+            }
+            if (ok) {
+                File(destDir, MARKER_FILE).writeText("ok")
+                Log.i(TAG, "Installed bundled model: $id (${toCopy.size} files)")
+            }
+        }
+    }
+
     fun resolveSherpaStreamingTransducer(modelId: String): SherpaStreamingTransducerPaths? {
         val base = getModelDir(modelId)
         if (!base.isDirectory) return null
@@ -59,6 +98,38 @@ class ModelManager(private val context: Context) {
                 dataDirPath = espeak.absolutePath,
                 lexiconPath = lexPath,
                 dictDirPath = dictPath
+            )
+        }
+        return null
+    }
+
+    /**
+     * piper-plus voice layout: a single `*.onnx` model plus its `*.onnx.json`
+     * (or `*.json`) config. No espeak/tokens files — G2P is built into the
+     * native engine.
+     */
+    fun resolvePiperPlusTts(modelId: String): PiperPlusTtsPaths? {
+        val base = getModelDir(modelId)
+        if (!base.isDirectory) return null
+        for (root in modelRoots(base)) {
+            val onnxFiles = root.listFiles()
+                ?.filter { f -> f.isFile && f.name.endsWith(".onnx", ignoreCase = true) }
+                .orEmpty()
+            if (onnxFiles.isEmpty()) continue
+            val modelFile = onnxFiles
+                .filter { !it.name.contains(".int8.", ignoreCase = true) }
+                .maxByOrNull { it.length() }
+                ?: onnxFiles.maxByOrNull { it.length() }
+                ?: continue
+            val jsonSidecar = File(root, modelFile.name + ".json")
+            val configFile = when {
+                jsonSidecar.isFile -> jsonSidecar
+                else -> root.listFiles()
+                    ?.firstOrNull { it.isFile && it.name.endsWith(".json", ignoreCase = true) }
+            }
+            return PiperPlusTtsPaths(
+                modelPath = modelFile.absolutePath,
+                configPath = configFile?.absolutePath,
             )
         }
         return null
@@ -158,6 +229,8 @@ class ModelManager(private val context: Context) {
     companion object {
         private const val TAG = "ModelManager"
         private const val MARKER_FILE = ".kawaiipet_model_ok"
+        private const val ASSET_MODELS_DIR = "models"
+        private val installLock = Any()
 
         private fun pickSherpaOnnx(dir: File, role: String): File? {
             val files = dir.listFiles() ?: return null
@@ -187,6 +260,12 @@ data class SherpaVitsTtsPaths(
     val dataDirPath: String,
     val lexiconPath: String,
     val dictDirPath: String
+)
+
+/** piper-plus voice: single *.onnx model + optional *.onnx.json config. */
+data class PiperPlusTtsPaths(
+    val modelPath: String,
+    val configPath: String?,
 )
 
 /** Moonshine v2: encoder + merged decoder (.ort or .onnx) + tokens.txt */

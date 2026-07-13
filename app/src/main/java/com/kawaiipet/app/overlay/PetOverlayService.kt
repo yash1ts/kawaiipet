@@ -72,6 +72,7 @@ class PetOverlayService : Service() {
         startAsForeground()
 
         serviceScope.launch(Dispatchers.IO) {
+            modelManager.installBundledModelsIfNeeded()
             val sttId = preferenceManager.getSttModelId()
             val ttsId = preferenceManager.getTtsModelId()
             val loadStt = sttId.isNotBlank() && modelManager.isModelDownloaded(sttId)
