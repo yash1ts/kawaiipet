@@ -3,17 +3,15 @@ package com.kawaiipet.app.ui.screens
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -33,27 +31,24 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.navigation.NavController
-import com.kawaiipet.app.memory.MemoryRepository
-import com.kawaiipet.app.memory.db.FactEntity
+import com.kawaiipet.app.llm.LlmPromptDefaults
+import com.kawaiipet.app.memory.MemoryPipeline
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
 import javax.inject.Inject
 
 @HiltViewModel
 class MemoryViewModel @Inject constructor(
-    private val repository: MemoryRepository
+    private val memoryPipeline: MemoryPipeline,
 ) : ViewModel() {
 
-    val facts = repository.allFacts
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+    val memoryParagraph = memoryPipeline.memoryParagraph
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), "")
 
-    fun deleteFact(fact: FactEntity) {
-        viewModelScope.launch { repository.deleteFact(fact) }
+    fun clearMemory() {
+        viewModelScope.launch { memoryPipeline.clearMemory() }
     }
 }
 
@@ -61,9 +56,9 @@ class MemoryViewModel @Inject constructor(
 @Composable
 fun MemoryScreen(
     navController: NavController,
-    viewModel: MemoryViewModel = hiltViewModel()
+    viewModel: MemoryViewModel = hiltViewModel(),
 ) {
-    val facts by viewModel.facts.collectAsState()
+    val memory by viewModel.memoryParagraph.collectAsState()
 
     Scaffold(
         topBar = {
@@ -73,85 +68,66 @@ fun MemoryScreen(
                     IconButton(onClick = { navController.popBackStack() }) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
                     }
-                }
+                },
+                actions = {
+                    if (memory.isNotBlank()) {
+                        IconButton(onClick = { viewModel.clearMemory() }) {
+                            Icon(Icons.Default.Delete, contentDescription = "Clear memory")
+                        }
+                    }
+                },
             )
-        }
+        },
     ) { padding ->
-        if (facts.isEmpty()) {
+        if (memory.isBlank()) {
             Box(
                 modifier = Modifier
                     .fillMaxSize()
                     .padding(padding),
-                contentAlignment = Alignment.Center
+                contentAlignment = Alignment.Center,
             ) {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Text(
-                        "No memories yet",
-                        style = MaterialTheme.typography.titleLarge,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Text(
-                        "Chat with your pet and it will remember things about you!",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
+                Text(
+                    "No memory yet. Chat with your pet and it will keep a short note.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(24.dp),
+                )
             }
         } else {
-            LazyColumn(
+            Column(
                 modifier = Modifier
                     .fillMaxSize()
                     .padding(padding)
-                    .padding(horizontal = 16.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp)
+                    .padding(16.dp)
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {
-                item { Spacer(modifier = Modifier.height(4.dp)) }
-
-                items(facts, key = { it.id }) { fact ->
-                    FactCard(fact = fact, onDelete = { viewModel.deleteFact(fact) })
-                }
-
-                item { Spacer(modifier = Modifier.height(8.dp)) }
-            }
-        }
-    }
-}
-
-@Composable
-private fun FactCard(fact: FactEntity, onDelete: () -> Unit) {
-    val dateFormat = SimpleDateFormat("MMM d, yyyy", Locale.getDefault())
-
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        colors = CardDefaults.cardColors(
-            containerColor = MaterialTheme.colorScheme.surfaceVariant
-        )
-    ) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(12.dp),
-            verticalAlignment = Alignment.Top
-        ) {
-            Column(modifier = Modifier.weight(1f)) {
                 Text(
-                    text = fact.factText,
-                    style = MaterialTheme.typography.bodyLarge
-                )
-                Spacer(modifier = Modifier.height(4.dp))
-                Text(
-                    text = "${fact.category} · ${dateFormat.format(Date(fact.createdAt))}",
+                    "One short paragraph (max ${LlmPromptDefaults.MAX_MEMORY_WORDS} words) " +
+                        "kept for SmolLM’s small context.",
                     style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
-            }
-            IconButton(onClick = onDelete) {
-                Icon(
-                    Icons.Default.Delete,
-                    contentDescription = "Delete",
-                    tint = MaterialTheme.colorScheme.error
-                )
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.surfaceVariant,
+                    ),
+                ) {
+                    Text(
+                        text = memory,
+                        style = MaterialTheme.typography.bodyLarge,
+                        modifier = Modifier.padding(16.dp),
+                    )
+                }
+                Button(
+                    onClick = { viewModel.clearMemory() },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 8.dp),
+                ) {
+                    Text("Clear memory")
+                }
             }
         }
     }

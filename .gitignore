@@ -33,8 +33,12 @@ captures/
 # Downloaded / repacked on Gradle build (see app/build.gradle.kts): upstream Sherpa AAR and -app repack
 /app/libs/sherpa-onnx-*.aar
 
+# Legacy piper-plus (TTS is Sherpa KittenTTS; do not ship in APK)
+/app/libs/piper-plus*.aar
+
 # Downloaded STT/TTS weights (app storage / optional dev copies under assets)
 /app/src/main/assets/voice_models/
+/app/src/main/assets/models/
 
 # Optional local LLM assets (not used by the app; ignore if present)
 /app/src/main/assets/llm/

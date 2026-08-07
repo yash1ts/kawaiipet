@@ -19,6 +19,8 @@ class MemoryRepository @Inject constructor(
 
     suspend fun deleteFact(fact: FactEntity) = factDao.delete(fact)
 
+    suspend fun purgeContaminatedFacts() = factDao.deleteContaminatedFacts()
+
     suspend fun touchFact(factId: Long) =
         factDao.updateLastAccessed(factId, System.currentTimeMillis())
 

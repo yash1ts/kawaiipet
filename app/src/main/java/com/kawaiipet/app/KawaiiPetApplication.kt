@@ -5,15 +5,25 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import com.kawaiipet.app.BuildConfig
 import com.kawaiipet.app.audio.VoiceEngineWarmup
+import com.kawaiipet.app.memory.MemoryRepository
+import com.kawaiipet.app.memory.ShortTermMemory
+import com.kawaiipet.app.util.PreferenceManager
 import com.posthog.android.PostHogAndroid
 import com.posthog.android.PostHogAndroidConfig
 import dagger.hilt.android.HiltAndroidApp
 import javax.inject.Inject
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 
 @HiltAndroidApp
 class KawaiiPetApplication : Application() {
 
     @Inject lateinit var voiceEngineWarmup: VoiceEngineWarmup
+    @Inject lateinit var memoryRepository: MemoryRepository
+    @Inject lateinit var shortTermMemory: ShortTermMemory
+    @Inject lateinit var preferenceManager: PreferenceManager
 
     override fun onCreate() {
         super.onCreate()
@@ -24,6 +34,15 @@ class KawaiiPetApplication : Application() {
         }
         voiceEngineWarmup.startWarmup()
         createNotificationChannel()
+        // Drop known contaminated memory lines that made SmolLM loop.
+        CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
+            runCatching {
+                preferenceManager.migratePersonalityDefaultIfNeeded()
+                preferenceManager.migrateSttModelIfNeeded()
+                memoryRepository.purgeContaminatedFacts()
+                shortTermMemory.clear()
+            }
+        }
     }
 
     private fun createNotificationChannel() {

@@ -9,7 +9,16 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.viewModels
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.hilt.navigation.compose.hiltViewModel
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.kawaiipet.app.assets.AssetDownloadState
 import com.kawaiipet.app.ui.navigation.AppNavigation
+import com.kawaiipet.app.ui.screens.DownloadingAssetsScreen
 import com.kawaiipet.app.ui.theme.KawaiiPetTheme
 import com.kawaiipet.app.util.PetLauncher
 import dagger.hilt.android.AndroidEntryPoint
@@ -18,15 +27,38 @@ import dagger.hilt.android.AndroidEntryPoint
 class MainActivity : ComponentActivity() {
 
     private val startPetRequestViewModel: StartPetRequestViewModel by viewModels()
+    private var askedBatteryExemption = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         handleStartPetIntent(intent)
-        requestBatteryOptimizationExemptionIfNeeded()
         enableEdgeToEdge()
         setContent {
             KawaiiPetTheme {
-                AppNavigation()
+                val assetsViewModel: AssetsBootstrapViewModel = hiltViewModel()
+                val assetsState by assetsViewModel.state.collectAsStateWithLifecycle()
+                var batteryPromptDone by remember { mutableStateOf(askedBatteryExemption) }
+
+                LaunchedEffect(Unit) {
+                    assetsViewModel.ensureAssets()
+                }
+
+                // Don't interrupt first-run download with the battery dialog.
+                LaunchedEffect(assetsState) {
+                    if (assetsState is AssetDownloadState.Ready && !batteryPromptDone) {
+                        batteryPromptDone = true
+                        askedBatteryExemption = true
+                        requestBatteryOptimizationExemptionIfNeeded()
+                    }
+                }
+
+                when (val s = assetsState) {
+                    AssetDownloadState.Ready -> AppNavigation()
+                    else -> DownloadingAssetsScreen(
+                        state = s,
+                        onRetry = { assetsViewModel.retry() },
+                    )
+                }
             }
         }
     }

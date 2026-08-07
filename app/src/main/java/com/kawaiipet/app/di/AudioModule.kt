@@ -5,8 +5,8 @@ import com.kawaiipet.app.audio.AudioPipeline
 import com.kawaiipet.app.audio.AudioRecordManager
 import com.kawaiipet.app.audio.AudioTrackManager
 import com.kawaiipet.app.audio.ModelManager
-import com.kawaiipet.app.audio.PiperPlusTts
 import com.kawaiipet.app.audio.SherpaSTT
+import com.kawaiipet.app.audio.SherpaTTS
 import com.kawaiipet.app.util.PreferenceManager
 import dagger.Module
 import dagger.Provides
@@ -41,17 +41,15 @@ object AudioModule {
 
     @Provides
     @Singleton
-    fun providePiperPlusTts(
-        @ApplicationContext context: Context,
-        modelManager: ModelManager,
-    ): PiperPlusTts = PiperPlusTts(context, modelManager)
+    fun provideSherpaTTS(modelManager: ModelManager): SherpaTTS =
+        SherpaTTS(modelManager)
 
     @Provides
     @Singleton
     fun provideAudioPipeline(
         @ApplicationContext context: Context,
         stt: SherpaSTT,
-        tts: PiperPlusTts,
+        tts: SherpaTTS,
         recorder: AudioRecordManager,
         player: AudioTrackManager,
         preferenceManager: PreferenceManager,

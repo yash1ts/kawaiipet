@@ -103,38 +103,6 @@ class ModelManager(private val context: Context) {
         return null
     }
 
-    /**
-     * piper-plus voice layout: a single `*.onnx` model plus its `*.onnx.json`
-     * (or `*.json`) config. No espeak/tokens files — G2P is built into the
-     * native engine.
-     */
-    fun resolvePiperPlusTts(modelId: String): PiperPlusTtsPaths? {
-        val base = getModelDir(modelId)
-        if (!base.isDirectory) return null
-        for (root in modelRoots(base)) {
-            val onnxFiles = root.listFiles()
-                ?.filter { f -> f.isFile && f.name.endsWith(".onnx", ignoreCase = true) }
-                .orEmpty()
-            if (onnxFiles.isEmpty()) continue
-            val modelFile = onnxFiles
-                .filter { !it.name.contains(".int8.", ignoreCase = true) }
-                .maxByOrNull { it.length() }
-                ?: onnxFiles.maxByOrNull { it.length() }
-                ?: continue
-            val jsonSidecar = File(root, modelFile.name + ".json")
-            val configFile = when {
-                jsonSidecar.isFile -> jsonSidecar
-                else -> root.listFiles()
-                    ?.firstOrNull { it.isFile && it.name.endsWith(".json", ignoreCase = true) }
-            }
-            return PiperPlusTtsPaths(
-                modelPath = modelFile.absolutePath,
-                configPath = configFile?.absolutePath,
-            )
-        }
-        return null
-    }
-
     fun resolveSherpaMoonshine(modelId: String): SherpaMoonshinePaths? {
         val base = getModelDir(modelId)
         if (!base.isDirectory) return null
@@ -143,6 +111,36 @@ class ModelManager(private val context: Context) {
             return p
         }
         return null
+    }
+
+    /** NeMo EncDec CTC: `model.int8.onnx` (preferred) or `model.onnx` + `tokens.txt`. */
+    fun resolveSherpaNemoCtc(modelId: String): SherpaNemoCtcPaths? {
+        val base = getModelDir(modelId)
+        if (!base.isDirectory) return null
+        for (root in modelRoots(base)) {
+            val p = resolveSherpaNemoCtcFromRoot(root) ?: continue
+            return p
+        }
+        return null
+    }
+
+    private fun resolveSherpaNemoCtcFromRoot(root: File): SherpaNemoCtcPaths? {
+        val tokens = File(root, "tokens.txt")
+        if (!tokens.isFile) return null
+        val int8 = File(root, "model.int8.onnx")
+        val fp32 = File(root, "model.onnx")
+        val model = when {
+            int8.isFile -> int8
+            fp32.isFile -> fp32
+            else -> root.listFiles()?.firstOrNull { f ->
+                f.isFile && f.name.endsWith(".onnx", ignoreCase = true) &&
+                    f.name.contains("model", ignoreCase = true)
+            } ?: return null
+        }
+        return SherpaNemoCtcPaths(
+            modelPath = model.absolutePath,
+            tokensPath = tokens.absolutePath,
+        )
     }
 
     private fun resolveSherpaMoonshineFromRoot(root: File): SherpaMoonshinePaths? {
@@ -209,6 +207,13 @@ class ModelManager(private val context: Context) {
         return hasUsableModelContent(dir)
     }
 
+    /** Marks [modelId] as successfully installed after a network download. */
+    fun markModelOk(modelId: String) {
+        val dir = getModelDir(modelId)
+        dir.mkdirs()
+        File(dir, MARKER_FILE).writeText("ok")
+    }
+
     private fun modelRoots(base: File): List<File> = buildList {
         add(base)
         base.listFiles()?.sortedBy { it.name }?.forEach { if (it.isDirectory) add(it) }
@@ -262,17 +267,17 @@ data class SherpaVitsTtsPaths(
     val dictDirPath: String
 )
 
-/** piper-plus voice: single *.onnx model + optional *.onnx.json config. */
-data class PiperPlusTtsPaths(
-    val modelPath: String,
-    val configPath: String?,
-)
-
 /** Moonshine v2: encoder + merged decoder (.ort or .onnx) + tokens.txt */
 data class SherpaMoonshinePaths(
     val encoderPath: String,
     val mergedDecoderPath: String,
     val tokensPath: String
+)
+
+/** NeMo EncDec CTC: single onnx + tokens.txt */
+data class SherpaNemoCtcPaths(
+    val modelPath: String,
+    val tokensPath: String,
 )
 
 /** Kitten TTS: model.onnx + voices.bin (raw floats) + tokens.txt + espeak-ng-data/. */

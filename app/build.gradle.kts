@@ -39,6 +39,13 @@ configurations.configureEach {
         // Compose BOM can pull core-ktx 1.17+ which requires compileSdk 36 / AGP 8.9.1+
         force("androidx.core:core-ktx:1.15.0")
         force("androidx.core:core:1.15.0")
+        // LiteRT-LM AARs call SendChannel.close$default (interface-static bridge)
+        // that only exists in kotlinx-coroutines 1.11.0+, while the published POM
+        // still declares 1.9.0 — without this force, reply crashes with NoSuchMethodError.
+        // https://github.com/google-ai-edge/litert-lm/issues/2812
+        force("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.11.0")
+        force("org.jetbrains.kotlinx:kotlinx-coroutines-core-jvm:1.11.0")
+        force("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.11.0")
     }
 }
 
@@ -65,6 +72,11 @@ android {
         versionName = "1.0"
         buildConfigField("String", "POSTHOG_API_KEY", "\"$posthogApiKeyProp\"")
         buildConfigField("String", "POSTHOG_HOST", "\"$posthogHostProp\"")
+        // Pixel / modern phones: skip x86 + armeabi-v7a native libs (~100MB+ APK savings).
+        // Emulator: use an arm64 system image, or temporarily add "x86_64".
+        ndk {
+            abiFilters += listOf("arm64-v8a")
+        }
     }
 
     buildTypes {
@@ -101,12 +113,12 @@ android {
     }
 
     androidResources {
-        noCompress += listOf("onnx", "ort")
+        noCompress += listOf("onnx", "ort", "litertlm", "task")
     }
 
     packaging {
         jniLibs {
-            // 16 KB page-size compatibility (Android 15+); piper-plus .so are aligned.
+            // 16 KB page-size compatibility (Android 15+).
             useLegacyPackaging = false
         }
     }
@@ -197,12 +209,11 @@ dependencies {
 
     implementation(files(sherpaOnnxAppAarFile.asFile))
 
-    // Native piper-plus neural TTS (arm64-v8a only). Reuses the onnxruntime.so
-    // shipped by the Sherpa AAR (ORT 1.23.2 is backward-compatible with the
-    // 1.20.0 piper was built against), so this AAR ships without its own ORT.
-    implementation(files(layout.projectDirectory.file("libs/piper-plus-release.aar")))
-
     implementation(libs.posthog.android)
 
-    implementation(libs.mlkit.genai.prompt)
+    // Google LiteRT-LM (SmolLM2 on-device)
+    implementation(libs.litertlm.android)
+
+    // tar.bz2 extraction for Sherpa voice packs
+    implementation(libs.commons.compress)
 }

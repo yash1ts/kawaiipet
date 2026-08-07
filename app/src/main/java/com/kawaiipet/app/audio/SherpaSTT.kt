@@ -4,6 +4,7 @@ import android.util.Log
 import com.k2fsa.sherpa.onnx.HomophoneReplacerConfig
 import com.k2fsa.sherpa.onnx.OfflineModelConfig
 import com.k2fsa.sherpa.onnx.OfflineMoonshineModelConfig
+import com.k2fsa.sherpa.onnx.OfflineNemoEncDecCtcModelConfig
 import com.k2fsa.sherpa.onnx.OfflineRecognizer
 import com.k2fsa.sherpa.onnx.OfflineRecognizerConfig
 import com.k2fsa.sherpa.onnx.OfflineStream
@@ -15,12 +16,12 @@ import com.k2fsa.sherpa.onnx.OnlineStream
 import com.k2fsa.sherpa.onnx.OnlineTransducerModelConfig
 
 /**
- * Sherpa-ONNX STT: streaming **Zipformer transducer** (online) or **Moonshine v2** (offline utterance).
+ * Sherpa-ONNX STT: streaming Zipformer transducer, offline Moonshine, or offline NeMo CTC.
  */
 class SherpaSTT(private val modelManager: ModelManager) {
 
-    /** Moonshine uses OfflineRecognizer JNI — must not overlap decode/acceptWaveform across threads. */
-    private val moonshineJniLock = Any()
+    /** OfflineRecognizer JNI — must not overlap decode/acceptWaveform across threads. */
+    private val offlineJniLock = Any()
 
     private var onlineRecognizer: OnlineRecognizer? = null
     private var onlineStream: OnlineStream? = null
@@ -28,7 +29,8 @@ class SherpaSTT(private val modelManager: ModelManager) {
     private var offlineRecognizer: OfflineRecognizer? = null
     private var offlineStream: OfflineStream? = null
 
-    private var useMoonshine: Boolean = false
+    private var useOffline: Boolean = false
+    private var offlineKind: String = ""
 
     private var initializedForModelId: String? = null
 
@@ -50,13 +52,17 @@ class SherpaSTT(private val modelManager: ModelManager) {
 
         val transducer = modelManager.resolveSherpaStreamingTransducer(modelId)
         if (transducer != null) {
-            useMoonshine = false
+            useOffline = false
             return initOnlineTransducer(modelId, transducer)
+        }
+
+        val nemo = modelManager.resolveSherpaNemoCtc(modelId)
+        if (nemo != null) {
+            return initNemoCtcOffline(modelId, nemo)
         }
 
         val moonshine = modelManager.resolveSherpaMoonshine(modelId)
         if (moonshine != null) {
-            useMoonshine = true
             return initMoonshineOffline(modelId, moonshine)
         }
 
@@ -97,6 +103,17 @@ class SherpaSTT(private val modelManager: ModelManager) {
         }
     }
 
+    private fun initNemoCtcOffline(modelId: String, paths: SherpaNemoCtcPaths): Boolean {
+        val modelCfg = OfflineModelConfig().apply {
+            nemo = OfflineNemoEncDecCtcModelConfig(model = paths.modelPath)
+            tokens = paths.tokensPath
+            numThreads = sttNumThreads()
+            debug = false
+            provider = "cpu"
+        }
+        return initOfflineRecognizer(modelId, modelCfg, kind = "NeMo CTC")
+    }
+
     private fun initMoonshineOffline(modelId: String, paths: SherpaMoonshinePaths): Boolean {
         val moon = OfflineMoonshineModelConfig(
             preprocessor = "",
@@ -112,6 +129,14 @@ class SherpaSTT(private val modelManager: ModelManager) {
             debug = false
             provider = "cpu"
         }
+        return initOfflineRecognizer(modelId, modelCfg, kind = "Moonshine")
+    }
+
+    private fun initOfflineRecognizer(
+        modelId: String,
+        modelCfg: OfflineModelConfig,
+        kind: String,
+    ): Boolean {
         val config = OfflineRecognizerConfig().apply {
             featConfig = SttEngineConfig.featureConfig()
             modelConfig = modelCfg
@@ -126,12 +151,16 @@ class SherpaSTT(private val modelManager: ModelManager) {
         }
         return try {
             offlineRecognizer = OfflineRecognizer(assetManager = null, config = config)
+            useOffline = true
+            offlineKind = kind
             initializedForModelId = modelId
-            Log.i(TAG, "STT initialized (Moonshine offline): $modelId")
+            Log.i(TAG, "STT initialized ($kind offline): $modelId")
             true
         } catch (t: Throwable) {
-            Log.e(TAG, "STT Moonshine init failed", t)
+            Log.e(TAG, "STT $kind init failed", t)
             offlineRecognizer = null
+            useOffline = false
+            offlineKind = ""
             initializedForModelId = null
             false
         }
@@ -139,13 +168,13 @@ class SherpaSTT(private val modelManager: ModelManager) {
 
     fun startStream() {
         endStream()
-        if (useMoonshine) {
-            synchronized(moonshineJniLock) {
+        if (useOffline) {
+            synchronized(offlineJniLock) {
                 val rec = offlineRecognizer ?: return
                 offlineStream = try {
                     rec.createStream()
                 } catch (t: Throwable) {
-                    Log.e(TAG, "Moonshine createStream failed", t)
+                    Log.e(TAG, "$offlineKind createStream failed", t)
                     null
                 }
             }
@@ -161,13 +190,13 @@ class SherpaSTT(private val modelManager: ModelManager) {
     }
 
     fun acceptWaveform(samples: FloatArray) {
-        if (useMoonshine) {
-            synchronized(moonshineJniLock) {
+        if (useOffline) {
+            synchronized(offlineJniLock) {
                 val s = offlineStream ?: return
                 try {
                     s.acceptWaveform(samples, SttEngineConfig.SAMPLE_RATE)
                 } catch (t: Throwable) {
-                    Log.e(TAG, "Moonshine acceptWaveform failed", t)
+                    Log.e(TAG, "$offlineKind acceptWaveform failed", t)
                 }
             }
             return
@@ -185,7 +214,7 @@ class SherpaSTT(private val modelManager: ModelManager) {
     }
 
     fun isEndpoint(): Boolean {
-        if (useMoonshine) return false
+        if (useOffline) return false
         val s = onlineStream ?: return false
         val rec = onlineRecognizer ?: return false
         return try {
@@ -196,7 +225,7 @@ class SherpaSTT(private val modelManager: ModelManager) {
     }
 
     fun getPartialResult(): String {
-        if (useMoonshine) return ""
+        if (useOffline) return ""
         val s = onlineStream ?: return ""
         val rec = onlineRecognizer ?: return ""
         return try {
@@ -207,15 +236,15 @@ class SherpaSTT(private val modelManager: ModelManager) {
     }
 
     fun getFinalResult(): String {
-        if (useMoonshine) {
-            synchronized(moonshineJniLock) {
+        if (useOffline) {
+            synchronized(offlineJniLock) {
                 val s = offlineStream ?: return ""
                 val rec = offlineRecognizer ?: return ""
                 return try {
                     rec.decode(s)
                     rec.getResult(s).text.trim()
                 } catch (t: Throwable) {
-                    Log.e(TAG, "Moonshine final decode failed", t)
+                    Log.e(TAG, "$offlineKind final decode failed", t)
                     ""
                 }
             }
@@ -229,7 +258,7 @@ class SherpaSTT(private val modelManager: ModelManager) {
         } catch (_: Exception) {
         }
         onlineStream = null
-        synchronized(moonshineJniLock) {
+        synchronized(offlineJniLock) {
             try {
                 offlineStream?.release()
             } catch (_: Exception) {
@@ -245,21 +274,21 @@ class SherpaSTT(private val modelManager: ModelManager) {
         } catch (_: Exception) {
         }
         onlineRecognizer = null
-        synchronized(moonshineJniLock) {
+        synchronized(offlineJniLock) {
             try {
                 offlineRecognizer?.release()
             } catch (_: Exception) {
             }
             offlineRecognizer = null
         }
-        useMoonshine = false
+        useOffline = false
+        offlineKind = ""
         initializedForModelId = null
     }
 
     companion object {
         private const val TAG = "SherpaSTT"
 
-        /** ONNX intra-op threads; 2 was conservative and under-used multi-core SoCs. */
         private fun sttNumThreads(): Int =
             minOf(4, maxOf(2, Runtime.getRuntime().availableProcessors()))
     }

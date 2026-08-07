@@ -20,12 +20,12 @@ object SttEngineConfig {
         FeatureConfig(SAMPLE_RATE, FEATURE_DIM, FEATURE_DITHER)
 
     /**
-     * Endpoint rules for Zipformer streaming: slightly patient trailing silence so words aren’t cut,
-     * while still ending reasonably soon after the user stops.
+     * Endpoint rules for Zipformer streaming: more patient trailing silence so pauses
+     * mid-sentence aren't cut as aggressively.
      */
     fun endpointConfig(): EndpointConfig = EndpointConfig(
-        EndpointRule(true, minTrailingSilence = 2.0f, minUtteranceLength = 0f),
-        EndpointRule(false, minTrailingSilence = 1.35f, minUtteranceLength = 0f),
+        EndpointRule(true, minTrailingSilence = 2.8f, minUtteranceLength = 0f),
+        EndpointRule(false, minTrailingSilence = 2.0f, minUtteranceLength = 0f),
         EndpointRule(false, minTrailingSilence = 0f, minUtteranceLength = 0f)
     )
 }

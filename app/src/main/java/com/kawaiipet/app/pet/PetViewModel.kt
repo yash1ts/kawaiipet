@@ -5,8 +5,8 @@ import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.kawaiipet.app.audio.AudioPipeline
-import com.kawaiipet.app.audio.SentenceEmitBuffer
 import com.kawaiipet.app.llm.ConversationManager
+import com.kawaiipet.app.llm.LlmPromptDefaults
 import com.kawaiipet.app.audio.ModelManager
 import com.kawaiipet.app.overlay.OverlayState
 import com.kawaiipet.app.util.PermissionHelper
@@ -17,8 +17,6 @@ import kotlinx.coroutines.CancellationException
 import java.io.FileNotFoundException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.channels.Channel
-import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -118,19 +116,16 @@ class PetViewModel(
                     userText.isBlank() -> {
                         animationController.setExpression(PetExpression.SAD)
                         uiFeedback.softNegative()
-                        _currentResponse.value = "I didn't hear anything..."
-                        _overlayState.value = OverlayState.Speaking("I didn't hear anything...")
+                        _currentResponse.value = LlmPromptDefaults.DIDNT_CATCH_REPLY
+                        _overlayState.value = OverlayState.Speaking(LlmPromptDefaults.DIDNT_CATCH_REPLY)
                         delay(2000L)
                         returnToIdle()
                     }
                     userText == "[voice]" -> {
                         animationController.setExpression(PetExpression.THINKING)
-                        uiFeedback.petThinking()
-                        _overlayState.value = OverlayState.Processing("(voice input)")
-                        _currentResponse.value = "I heard you! But I need a speech model to understand. Download one in Settings."
-                        animationController.setExpression(PetExpression.SAD)
                         uiFeedback.softNegative()
-                        _overlayState.value = OverlayState.Speaking(_currentResponse.value)
+                        _currentResponse.value = LlmPromptDefaults.DIDNT_CATCH_REPLY
+                        _overlayState.value = OverlayState.Speaking(LlmPromptDefaults.DIDNT_CATCH_REPLY)
                         delay(emotionDurationMs)
                         returnToIdle()
                     }
@@ -151,7 +146,7 @@ class PetViewModel(
     }
 
     /**
-     * Loads Gemini Nano into memory while the user is still speaking, so inference
+     * Loads SmolLM into memory while the user is still speaking, so inference
      * can start the moment transcription finishes. Best-effort: failures are
      * ignored and chat-time ensureReady() remains the authority.
      */
@@ -191,54 +186,13 @@ class PetViewModel(
         Log.d(TAG, "State → PROCESSING/THINKING")
 
         try {
-            // Speak each completed LLM sentence as it streams — don't wait for the full reply.
-            val sentenceCh = Channel<String>(capacity = Channel.UNLIMITED)
-            val sentenceBuffer = SentenceEmitBuffer()
-            var talkingStarted = false
-
-            fun startTalkingUi() {
-                if (talkingStarted) return
-                talkingStarted = true
-                animationController.setExpression(PetExpression.TALKING)
-                _overlayState.value = OverlayState.Speaking(_currentResponse.value)
-                Log.d(TAG, "State → SPEAKING/TALKING (first sentence ready)")
-                uiFeedback.petSpeakingStart()
-                startMouthAnimation()
+            // Don't stream raw tokens into the bubble — SmolLM often dumps lists/meta
+            // that get filtered before TTS, which made shown text ≠ spoken text.
+            val llmResponse = withTimeoutOrNull(LLM_TIMEOUT_MS) {
+                conversationManager.processUserInput(userText)
             }
 
-            val response = withTimeoutOrNull(LLM_TIMEOUT_MS) {
-                coroutineScope {
-                    val speakJob = launch {
-                        audioPipeline.speakSentences(sentenceCh)
-                    }
-                    try {
-                        val llmResponse = conversationManager.processUserInput(userText) { partial ->
-                            _currentResponse.value = partial
-                            if (talkingStarted) {
-                                _overlayState.value = OverlayState.Speaking(partial)
-                            }
-                            for (sentence in sentenceBuffer.onPartial(partial)) {
-                                startTalkingUi()
-                                sentenceCh.trySend(sentence)
-                            }
-                        }
-                        val speakText = llmResponse.text.trim().ifBlank { "Hmm, I'm here!" }
-                        _currentResponse.value = speakText
-                        for (sentence in sentenceBuffer.finish(speakText)) {
-                            startTalkingUi()
-                            sentenceCh.trySend(sentence)
-                        }
-                        llmResponse
-                    } finally {
-                        sentenceCh.close()
-                        speakJob.join()
-                    }
-                }
-            }
-
-            stopMouthAnimation()
-
-            if (response == null) {
+            if (llmResponse == null) {
                 Log.w(TAG, "processUserInput timed out after ${LLM_TIMEOUT_MS}ms")
                 _currentResponse.value =
                     "That took too long. Check your connection and tap again."
@@ -250,30 +204,30 @@ class PetViewModel(
                 return
             }
 
+            val speakText = llmResponse.text.trim()
+                .ifBlank { LlmPromptDefaults.DIDNT_CATCH_REPLY }
+            _currentResponse.value = speakText
+            _overlayState.value = OverlayState.Speaking(speakText)
+            animationController.setExpression(PetExpression.TALKING)
+            Log.d(TAG, "State → SPEAKING/TALKING")
+            uiFeedback.petSpeakingStart()
+            startMouthAnimation()
+            audioPipeline.speak(speakText)
+            stopMouthAnimation()
+
             Analytics.capture(
                 event = "ai response received",
                 properties = mapOf(
-                    "expression" to response.expression.name,
-                    "response_length" to response.text.length,
+                    "expression" to llmResponse.expression.name,
+                    "response_length" to llmResponse.text.length,
                 ),
             )
 
-            if (!talkingStarted) {
-                // No sentence punctuation arrived — speak whatever we have as one shot.
-                val speakText = response.text.trim().ifBlank { "Hmm, I'm here!" }
-                _currentResponse.value = speakText
-                _overlayState.value = OverlayState.Speaking(speakText)
-                animationController.setExpression(PetExpression.TALKING)
-                startMouthAnimation()
-                audioPipeline.speak(speakText)
-                stopMouthAnimation()
-            }
-
-            animationController.setExpression(response.expression)
-            if (response.expression == PetExpression.HAPPY) {
+            animationController.setExpression(llmResponse.expression)
+            if (llmResponse.expression == PetExpression.HAPPY) {
                 uiFeedback.petEmotionPositive()
             }
-            Log.d(TAG, "State → EMOTION(${response.expression})")
+            Log.d(TAG, "State → EMOTION(${llmResponse.expression})")
             delay(emotionDurationMs)
         } catch (e: CancellationException) {
             returnToIdle()

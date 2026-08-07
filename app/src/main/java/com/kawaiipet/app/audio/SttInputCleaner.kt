@@ -3,8 +3,8 @@ package com.kawaiipet.app.audio
 import kotlin.math.sqrt
 
 /**
- * Stateful light conditioning before Sherpa: removes slow DC drift and very low-frequency rumble,
- * then applies a capped gain so quiet speech is lifted without heavy pumping between chunks.
+ * Light conditioning before Sherpa: DC block + mild high-pass, then capped leveling.
+ * Keep gain modest so VAD / decode aren't flooded with amplified noise.
  */
 class SttInputCleaner(
     private val sampleRate: Int = SttEngineConfig.SAMPLE_RATE
@@ -21,8 +21,20 @@ class SttInputCleaner(
         smoothedGain = 1f
     }
 
+    /** Raw RMS of PCM16 in [0, 1] — use for VAD before AGC. */
+    fun rawRms(samples: ShortArray): Float {
+        if (samples.isEmpty()) return 0f
+        var sum = 0.0
+        val scale = 1.0 / 32768.0
+        for (s in samples) {
+            val x = s * scale
+            sum += x * x
+        }
+        return sqrt(sum / samples.size).toFloat()
+    }
+
     /**
-     * Converts 16-bit PCM to float in [-1, 1], DC-blocks, high-passes ~100 Hz, then gentle
+     * Converts 16-bit PCM to float in [-1, 1], DC-blocks, high-passes ~80 Hz, then gentle
      * level normalization with a smoothed gain envelope.
      */
     fun cleanPcm16ToFloat(samples: ShortArray): FloatArray {
@@ -31,8 +43,8 @@ class SttInputCleaner(
         val n = samples.size
         val tmp = FloatArray(n)
 
-        val dcAlpha = 0.993f
-        val fc = 100f
+        val dcAlpha = 0.995f
+        val fc = 80f
         val dt = 1f / sampleRate
         val rc = 1f / (2f * Math.PI.toFloat() * fc)
         val hpCoeff = rc / (rc + dt)
@@ -51,7 +63,7 @@ class SttInputCleaner(
         for (v in tmp) sumSq += (v * v).toDouble()
         val rms = sqrt(sumSq / n).toFloat()
 
-        val targetRms = 0.065f
+        val targetRms = 0.06f
         val rawGain = if (rms > 1e-5f) (targetRms / rms).coerceIn(MIN_GAIN, MAX_GAIN) else 1f
         smoothedGain = SMOOTH * smoothedGain + (1f - SMOOTH) * rawGain
 
@@ -62,8 +74,8 @@ class SttInputCleaner(
     }
 
     companion object {
-        private const val MIN_GAIN = 0.55f
-        private const val MAX_GAIN = 3.2f
-        private const val SMOOTH = 0.88f
+        private const val MIN_GAIN = 0.8f
+        private const val MAX_GAIN = 1.8f
+        private const val SMOOTH = 0.92f
     }
 }

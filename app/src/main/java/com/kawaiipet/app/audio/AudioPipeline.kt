@@ -36,7 +36,7 @@ enum class PipelineState { IDLE, LISTENING, PROCESSING, SPEAKING }
 class AudioPipeline(
     private val appContext: Context,
     private val stt: SherpaSTT,
-    private val tts: PiperPlusTts,
+    private val tts: SherpaTTS,
     private val recorder: AudioRecordManager,
     private val player: AudioTrackManager,
     private val preferenceManager: PreferenceManager,
@@ -143,8 +143,13 @@ class AudioPipeline(
         val result = CompletableDeferred<String>()
         var silenceCount = 0
         var leadingSilenceChunks = 0
+        var speechFrameCount = 0
+        var speechChunksTotal = 0
         var hasSpeechHint = false
         var speechHintStartedAt = 0L
+        var peakSpeechRms = 0f
+        var noiseFloor = 0f
+        var noiseSamples = 0
         val recordingStartedAt = SystemClock.elapsedRealtime()
 
         recordJob = scope.launch {
@@ -152,58 +157,105 @@ class AudioPipeline(
                 val now = SystemClock.elapsedRealtime()
                 if (now - recordingStartedAt >= MAX_RECORDING_DURATION_MS) {
                     Log.d(TAG, "Sherpa: max recording duration reached")
-                    recorder.stop()
-                    result.complete(stt.getFinalResult())
+                    finishListen(result)
                     return@readLoop
                 }
 
+                // VAD on raw mic energy (before AGC). Feed leveled audio to the model.
+                val rawRms = sttInputCleaner.rawRms(samples)
                 val floatSamples = sttInputCleaner.cleanPcm16ToFloat(samples)
                 stt.acceptWaveform(floatSamples)
 
                 if (hasSpeechHint && stt.isEndpoint()) {
-                    // Stop capture before final decode: Moonshine OfflineRecognizer is not
-                    // thread-safe if decode runs while acceptWaveform is still feeding audio.
-                    recorder.stop()
-                    result.complete(stt.getFinalResult())
+                    finishListen(result)
                     return@readLoop
                 }
 
-                val rms = sqrt(rmsOfFloats(floatSamples)).toFloat()
-                if (rms > SPEECH_THRESHOLD) {
-                    if (!hasSpeechHint) {
-                        speechHintStartedAt = now
+                // Calibrate ambient noise from the first quiet chunks.
+                if (!hasSpeechHint && noiseSamples < NOISE_CALIBRATION_CHUNKS) {
+                    noiseFloor = if (noiseSamples == 0) {
+                        rawRms
+                    } else {
+                        noiseFloor * 0.85f + rawRms * 0.15f
                     }
-                    hasSpeechHint = true
+                    noiseSamples++
+                }
+
+                val speechGate = maxOf(MIN_SPEECH_GATE, noiseFloor + SPEECH_MARGIN)
+                val endFloor = if (hasSpeechHint && peakSpeechRms > 0f) {
+                    maxOf(
+                        MIN_END_FLOOR,
+                        noiseFloor + END_MARGIN,
+                        peakSpeechRms * SPEECH_END_RATIO,
+                    )
+                } else {
+                    speechGate
+                }
+
+                val isLoud = rawRms > speechGate
+                val isSilent = rawRms <= endFloor
+
+                if (isLoud) {
+                    speechFrameCount++
+                    peakSpeechRms = maxOf(peakSpeechRms, rawRms)
                     silenceCount = 0
                     leadingSilenceChunks = 0
+                    if (!hasSpeechHint && speechFrameCount >= MIN_SPEECH_FRAMES) {
+                        hasSpeechHint = true
+                        speechHintStartedAt = now
+                        Log.d(
+                            TAG,
+                            "Sherpa: speech start rawRms=%.4f gate=%.4f noise=%.4f".format(
+                                rawRms,
+                                speechGate,
+                                noiseFloor,
+                            ),
+                        )
+                    }
+                    if (hasSpeechHint) speechChunksTotal++
                 } else {
+                    speechFrameCount = 0
                     if (!hasSpeechHint) {
                         leadingSilenceChunks++
                         if (leadingSilenceChunks > LEADING_SILENCE_CHUNKS) {
-                            Log.d(TAG, "Sherpa: no speech within leading silence budget")
+                            Log.d(
+                                TAG,
+                                "Sherpa: no speech (noise=%.4f gate=%.4f)".format(
+                                    noiseFloor,
+                                    speechGate,
+                                ),
+                            )
                             recorder.stop()
                             result.complete("")
                             return@readLoop
                         }
-                    } else {
-                        silenceCount++
+                    } else if (isSilent) {
+                        // Don't end on the first brief dip — need enough voiced audio first.
+                        if (speechChunksTotal >= MIN_SPEECH_CHUNKS_BEFORE_END) {
+                            silenceCount++
+                        }
                     }
                 }
 
-                // Moonshine never reports isEndpoint(); noisy mics can keep RMS high forever so
-                // silenceCount never grows — cap utterance length so we always leave Listening.
                 if (hasSpeechHint && speechHintStartedAt > 0L &&
                     now - speechHintStartedAt >= MAX_UTTERANCE_AFTER_SPEECH_MS
                 ) {
                     Log.d(TAG, "Sherpa: max utterance length reached")
-                    recorder.stop()
-                    result.complete(stt.getFinalResult())
+                    finishListen(result)
                     return@readLoop
                 }
 
                 if (hasSpeechHint && silenceCount > SILENCE_CHUNKS_AFTER_SPEECH) {
-                    recorder.stop()
-                    result.complete(stt.getFinalResult())
+                    Log.d(
+                        TAG,
+                        "Sherpa: end silence rawRms=%.4f floor=%.4f chunks=%d voiced=%d".format(
+                            rawRms,
+                            endFloor,
+                            silenceCount,
+                            speechChunksTotal,
+                        ),
+                    )
+                    finishListen(result)
                     return@readLoop
                 }
             }
@@ -215,7 +267,13 @@ class AudioPipeline(
         val text = awaited ?: stt.getFinalResult()
 
         stt.endStream()
-        return text
+        return text.trim()
+    }
+
+    private fun finishListen(result: CompletableDeferred<String>) {
+        if (result.isCompleted) return
+        recorder.stop()
+        result.complete(stt.getFinalResult())
     }
 
     private suspend fun listenWithPlatformSpeechRecognizer(
@@ -235,11 +293,11 @@ class AudioPipeline(
                     // detection — this silence window delays every response.
                     putExtra(
                         RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS,
-                        1_200L
+                        1_400L
                     )
                     putExtra(
                         RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS,
-                        900L
+                        1_100L
                     )
                 }
 
@@ -336,7 +394,7 @@ class AudioPipeline(
 
                 val rms = sqrt(rmsOfPcm16(samples)).toFloat()
 
-                if (rms > SPEECH_THRESHOLD) {
+                if (rms > MIN_SPEECH_GATE) {
                     speechFrames++
                     silenceFrames = 0
 
@@ -367,18 +425,19 @@ class AudioPipeline(
 
     /**
      * Streams TTS: synthesizes each sentence as it arrives on [sentences] and plays
-     * audio as soon as the first chunk is ready (native piper-plus only).
+     * audio as soon as the first chunk is ready (Sherpa KittenTTS / VITS).
      */
     suspend fun speakSentences(sentences: ReceiveChannel<String>) {
         if (!tts.isInitialized) {
             awaitPetVoiceEnginesReady(timeoutMs = 90_000L)
         }
         if (!tts.isInitialized) {
-            Log.e(TAG, "piper-plus TTS not ready — skipping speak (no system fallback)")
+            Log.e(TAG, "Sherpa TTS not ready — skipping speak (no system fallback)")
             for (ignored in sentences) { /* drain */ }
             return
         }
 
+        val speakerId = preferenceManager.getTtsSpeakerId()
         _state.value = PipelineState.SPEAKING
         player.outputVolume = preferenceManager.getTtsVolume()
         try {
@@ -394,12 +453,12 @@ class AudioPipeline(
                         for (sentence in sentences) {
                             val piece = sentence.trim()
                             if (piece.isEmpty()) continue
-                            val samples = tts.generate(piece) ?: continue
+                            val samples = tts.generate(piece, speakerId = speakerId) ?: continue
                             if (samples.isEmpty()) continue
                             if (index == 0) {
                                 Log.i(
                                     TAG,
-                                    "piper-plus first audio chunk after " +
+                                    "Sherpa TTS first audio chunk after " +
                                         "${SystemClock.elapsedRealtime() - t0}ms " +
                                         "(streaming with LLM)",
                                 )
@@ -407,7 +466,7 @@ class AudioPipeline(
                             index++
                             pcm.send(samples)
                         }
-                        Log.i(TAG, "piper-plus spoke $index sentence(s)")
+                        Log.i(TAG, "Sherpa TTS spoke $index sentence(s)")
                     } finally {
                         pcm.close()
                     }
@@ -422,7 +481,7 @@ class AudioPipeline(
 
     /**
      * One-shot speak of a full string (splits into sentences internally).
-     * Native piper-plus only — no system TTS fallback.
+     * Sherpa KittenTTS only — no system TTS fallback.
      */
     suspend fun speak(text: String) {
         if (text.isBlank()) {
@@ -433,7 +492,7 @@ class AudioPipeline(
         coroutineScope {
             launch {
                 try {
-                    for (s in PiperPlusTts.splitIntoSentences(text.trim())) {
+                    for (s in SherpaTTS.splitIntoSentences(text.trim())) {
                         channel.send(s)
                     }
                 } finally {
@@ -490,21 +549,36 @@ class AudioPipeline(
         }
 
         /** Hard cap so long continuous speech does not hit client timeouts with empty STT. */
-        private const val MAX_RECORDING_DURATION_MS = 60_000L
+        private const val MAX_RECORDING_DURATION_MS = 30_000L
 
         /** Default wall-clock budget for listen (must allow [MAX_RECORDING_DURATION_MS] to elapse). */
-        private const val DEFAULT_LISTEN_TIMEOUT_MS = 65_000L
+        private const val DEFAULT_LISTEN_TIMEOUT_MS = 35_000L
 
-        private const val SPEECH_THRESHOLD = 0.025f
-        private const val MIN_SPEECH_FRAMES = 3
+        /** First chunks used to estimate ambient noise (100ms each). */
+        private const val NOISE_CALIBRATION_CHUNKS = 8
 
-        /** ~0.2s per chunk — 5 ≈ 1.0s of trailing silence before we stop listening. */
-        private const val SILENCE_CHUNKS_AFTER_SPEECH = 5
+        /** Speech must exceed noise floor by this much. */
+        private const val SPEECH_MARGIN = 0.012f
+        private const val MIN_SPEECH_GATE = 0.018f
 
-        /** ~0.2s per chunk at 16 kHz / 3200 samples — 50 ≈ 10s with no voiced audio. */
-        private const val LEADING_SILENCE_CHUNKS = 50
+        /** End-of-speech floor relative to noise / peak. */
+        private const val END_MARGIN = 0.006f
+        private const val MIN_END_FLOOR = 0.010f
+        private const val SPEECH_END_RATIO = 0.35f
 
-        /** Hard stop after speech energy was seen (handles constant background noise above threshold). */
-        private const val MAX_UTTERANCE_AFTER_SPEECH_MS = 28_000L
+        /** Need this many loud chunks before we treat it as real speech (~200ms). */
+        private const val MIN_SPEECH_FRAMES = 2
+
+        /** Don't cut off until we've heard ~400ms of voiced audio. */
+        private const val MIN_SPEECH_CHUNKS_BEFORE_END = 4
+
+        /** ~100ms per chunk — 12 ≈ 1.2s trailing silence. */
+        private const val SILENCE_CHUNKS_AFTER_SPEECH = 12
+
+        /** ~100ms per chunk — 100 ≈ 10s with no voiced audio. */
+        private const val LEADING_SILENCE_CHUNKS = 100
+
+        /** Hard stop after speech was detected. */
+        private const val MAX_UTTERANCE_AFTER_SPEECH_MS = 10_000L
     }
 }

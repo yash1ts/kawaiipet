@@ -31,6 +31,18 @@ interface FactDao {
     @Query("DELETE FROM facts WHERE id = :factId")
     suspend fun deleteById(factId: Long)
 
+    @Query(
+        "DELETE FROM facts WHERE lower(factText) LIKE '%having a great day%' " +
+            "OR lower(factText) LIKE '%the user is%' " +
+            "OR lower(factText) LIKE '%the user was%' " +
+            "OR lower(factText) LIKE '%the user enjoyed%' " +
+            "OR lower(factText) LIKE '%they were asked%' " +
+            "OR lower(factText) LIKE '%they enjoyed%' " +
+            "OR lower(factText) LIKE '%the user enjoys%' " +
+            "OR lower(factText) LIKE '%emotion tag%'",
+    )
+    suspend fun deleteContaminatedFacts()
+
     @Query("SELECT COUNT(*) FROM facts")
     suspend fun count(): Int
 }

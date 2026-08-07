@@ -4,7 +4,10 @@ import android.annotation.SuppressLint
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
+import android.media.audiofx.AcousticEchoCanceler
+import android.media.audiofx.AutomaticGainControl
 import android.media.audiofx.NoiseSuppressor
+import android.util.Log
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
@@ -13,6 +16,8 @@ class AudioRecordManager {
 
     private var audioRecord: AudioRecord? = null
     private var noiseSuppressor: NoiseSuppressor? = null
+    private var automaticGainControl: AutomaticGainControl? = null
+    private var acousticEchoCanceler: AcousticEchoCanceler? = null
     private var isRecording = false
 
     val sampleRate = SttEngineConfig.SAMPLE_RATE
@@ -37,6 +42,7 @@ class AudioRecordManager {
 
         val bufBytes = (minBuf * BUFFER_MULTIPLIER).coerceAtLeast(minBuf)
 
+        // VOICE_RECOGNITION: tuned for ASR (less music EQ / less speakerphone AEC than VOICE_COMMUNICATION).
         val record = try {
             AudioRecord.Builder()
                 .setAudioSource(MediaRecorder.AudioSource.VOICE_RECOGNITION)
@@ -69,19 +75,45 @@ class AudioRecordManager {
             return false
         }
 
+        enableCaptureEffects(record.audioSessionId)
+        isRecording = true
+        return true
+    }
+
+    private fun enableCaptureEffects(sessionId: Int) {
+        // Soft denoise helps in quiet rooms; keep AGC off in software path — we level in SttInputCleaner.
         if (NoiseSuppressor.isAvailable()) {
             try {
-                noiseSuppressor = NoiseSuppressor.create(record.audioSessionId)?.apply {
-                    enabled = true
-                }
-            } catch (_: Exception) {
+                noiseSuppressor = NoiseSuppressor.create(sessionId)?.apply { enabled = true }
+                Log.d(TAG, "NoiseSuppressor enabled")
+            } catch (t: Throwable) {
+                Log.w(TAG, "NoiseSuppressor failed", t)
                 noiseSuppressor?.release()
                 noiseSuppressor = null
             }
         }
-
-        isRecording = true
-        return true
+        // AEC reduces pet-speaker bleed into the mic when the overlay is speaking nearby next turn.
+        if (AcousticEchoCanceler.isAvailable()) {
+            try {
+                acousticEchoCanceler = AcousticEchoCanceler.create(sessionId)?.apply { enabled = true }
+                Log.d(TAG, "AcousticEchoCanceler enabled")
+            } catch (t: Throwable) {
+                Log.w(TAG, "AcousticEchoCanceler failed", t)
+                acousticEchoCanceler?.release()
+                acousticEchoCanceler = null
+            }
+        }
+        // Prefer system AGC off — double AGC with SttInputCleaner makes VAD noisy.
+        if (AutomaticGainControl.isAvailable()) {
+            try {
+                automaticGainControl = AutomaticGainControl.create(sessionId)?.apply { enabled = false }
+                Log.d(TAG, "AutomaticGainControl forced off")
+            } catch (t: Throwable) {
+                Log.w(TAG, "AutomaticGainControl failed", t)
+                automaticGainControl?.release()
+                automaticGainControl = null
+            }
+        }
     }
 
     suspend fun readLoop(onSamples: (ShortArray) -> Unit) = withContext(Dispatchers.IO) {
@@ -96,14 +128,16 @@ class AudioRecordManager {
 
     fun stop() {
         isRecording = false
-        try {
-            noiseSuppressor?.release()
-        } catch (_: Exception) {
-        }
+        releaseEffect(noiseSuppressor)
         noiseSuppressor = null
+        releaseEffect(automaticGainControl)
+        automaticGainControl = null
+        releaseEffect(acousticEchoCanceler)
+        acousticEchoCanceler = null
         try {
             audioRecord?.stop()
-        } catch (_: IllegalStateException) { }
+        } catch (_: IllegalStateException) {
+        }
         audioRecord?.release()
         audioRecord = null
     }
@@ -112,8 +146,21 @@ class AudioRecordManager {
         stop()
     }
 
+    private fun releaseEffect(effect: Any?) {
+        try {
+            when (effect) {
+                is NoiseSuppressor -> effect.release()
+                is AutomaticGainControl -> effect.release()
+                is AcousticEchoCanceler -> effect.release()
+            }
+        } catch (_: Exception) {
+        }
+    }
+
     companion object {
-        private const val CHUNK_SIZE = 3200
-        private const val BUFFER_MULTIPLIER = 3
+        private const val TAG = "AudioRecordManager"
+        /** 100ms chunks @ 16 kHz — snappier VAD than 200ms. */
+        private const val CHUNK_SIZE = 1600
+        private const val BUFFER_MULTIPLIER = 4
     }
 }
