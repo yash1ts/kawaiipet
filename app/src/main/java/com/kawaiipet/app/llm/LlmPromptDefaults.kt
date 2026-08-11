@@ -1,73 +1,275 @@
 package com.kawaiipet.app.llm
 
 /**
- * Prompt + sampler defaults for on-device SmolLM2-135M-Instruct via LiteRT-LM.
+ * Prompt + sampler defaults for on-device SmolLM2-360M via LiteRT-LM.
  *
  * Long-term memory is RAG-retrieved chunks (prompt-sized); short-term is recent messages.
  */
 object LlmPromptDefaults {
 
     /**
-     * Debug: pure SmolLM — no pet personality, no chat history, no reply filters.
+     * Debug: pure model — no pet personality, no chat history, no reply filters.
      * Flip to false to reconnect the normal pet pipeline (code stays in place).
      */
     const val PURE_SMOLLM_DEBUG = false
 
+    /**
+     * Shipped Mochi personality — a pet friend you hang out with, not a helper bot.
+     * Keep short: SmolLM2-360M follows brief role cues best.
+     */
     const val DEFAULT_PERSONALITY =
-        "A sharp, witty living companion — warm and playful, never babyish or dim. " +
-            "Curious, observant, and good at explaining things clearly. Speaks like a clever friend."
+        "Cozy playful virtual pet friend. Chat about daily life, feelings, and little moments. "
 
     /** Bump when [DEFAULT_PERSONALITY] changes so stored prefs refresh. */
-    const val PERSONALITY_DEFAULT_VERSION = 4
+    const val PERSONALITY_DEFAULT_VERSION = 12
 
-    const val MAX_REPLY_WORDS = 24
-    const val MAX_CHARS_PER_TURN = 120
+    /**
+     * Hard caps for spoken pet replies.
+     */
+    const val MAX_REPLY_WORDS = 48
+    const val MAX_REPLY_SENTENCES = 3
+    const val MAX_SPOKEN_CHARS = 280
+    const val MAX_CHARS_PER_TURN = 320
 
     /** Legacy paragraph prefs / migration clamp only — storage itself is uncapped in RAG. */
     const val MAX_MEMORY_WORDS = 250
     const val MAX_MEMORY_CHARS = 1500
 
-    /** Cap only what is injected into SmolLM's system prompt from retrieved chunks. */
-    const val MAX_RETRIEVED_MEMORY_WORDS = 120
-    const val MAX_RETRIEVED_MEMORY_CHARS = 600
+    /** Cap only what is injected into the system prompt from retrieved chunks. */
+    const val MAX_RETRIEVED_MEMORY_WORDS = 80
+    const val MAX_RETRIEVED_MEMORY_CHARS = 400
 
     /** Keep the last N chat messages as short-term history (full text, not summarized). */
-    const val MAX_SHORT_TERM_MESSAGES = 8
+    const val MAX_SHORT_TERM_MESSAGES = 6
 
-    const val DIDNT_CATCH_REPLY = "Sorry, I didn't catch that."
-    const val GREETING_FALLBACK = "Hey — good to see you. What's on your mind?"
+    const val DIDNT_CATCH_REPLY = "Huh? Say that again for me?"
+    const val GREETING_FALLBACK = "Hey! I'm good — how are you doing?"
+    const val STATUS_FALLBACK = "Aww, glad you're good! What's been going on?"
     const val CAPABILITY_FALLBACK =
-        "I can talk with you, answer questions, and keep you company."
-    const val CURIOUS_FALLBACK = "Interesting — tell me more about that."
+        "I'm your pet friend — talk to me about anything in your life."
+    const val CURIOUS_FALLBACK = "Ooh, I'm listening — tell me more?"
+    const val CLARIFY_FALLBACK = "Remind you of what? I'm right here."
 
-    const val SAMPLER_TOP_K = 40
+    /**
+     * Sampler defaults for SmolLM2-360M-Instruct — balanced friend chat
+     * (not as tight as 0.5/48, not as loose as 0.75/96).
+     */
+    const val SAMPLER_TOP_K = 30
     const val SAMPLER_TOP_P = 0.9
     const val SAMPLER_TEMPERATURE = 0.65
+    /** ~2 short spoken sentences + emotion tag. */
     const val MAX_OUTPUT_TOKENS = 72
 
+    /**
+     * Decode penalties for short pet replies (LiteRT-LM [RepetitionPenaltyConfig]).
+     * Applied only to the current generation window — keeps "I'm good…" / phrase loops down
+     * without crushing natural buddy chat.
+     *
+     * - repetitionPenalty (>= 1): HuggingFace-style multiplicative
+     * - presencePenalty: OpenAI-style once-seen token nudge
+     * - frequencyPenalty: OpenAI-style scales with how often a token reappears
+     * - windowSize 0 = whole current reply (fits [MAX_OUTPUT_TOKENS])
+     */
+    const val REPETITION_PENALTY = 1.25f
+    const val PRESENCE_PENALTY = 0.5f
+    const val FREQUENCY_PENALTY = 0.4f
+    const val PENALTY_WINDOW_SIZE = 0
+
+    /**
+     * Ban exact n-gram repeats in the current reply ([NoRepeatNgramConfig]).
+     * Size 4 stops "Please don't be so sorry" loops without blocking normal words.
+     */
+    const val NO_REPEAT_NGRAM_SIZE = 4
+    const val NO_REPEAT_NGRAM_WINDOW = 0
+
+    /**
+     * Stable system prompt for SmolLM2-360M — short role + friend chat style.
+     */
     fun buildSystemPrompt(
         petName: String,
         personality: String,
-        memoryParagraph: String,
+        @Suppress("UNUSED_PARAMETER") memoryParagraph: String = "",
     ): String {
         val name = petName.trim().ifEmpty { "Mochi" }
-        val vibe = personality.trim().ifEmpty { DEFAULT_PERSONALITY }.take(220)
-        val memory = clampRetrievedMemory(memoryParagraph)
+        // Keep the system preface short — prefill cost scales with this.
+        val vibe = personality.trim().ifEmpty { DEFAULT_PERSONALITY }.take(120)
         return buildString {
-            append("You are $name, an intelligent companion creature — not a dumb pet, not a chatbot. ")
-            append("Personality: $vibe ")
-            if (memory.isNotBlank()) {
-                append("Known facts about your friend (third person only; never speak as them): ")
-                append(memory)
-                append(' ')
-            }
-            append("Answer thoughtfully in one or two short sentences. ")
-            append("Be clear and smart; if they ask what something is, give a real explanation. ")
-            append("Never repeat their words back — reply with your own thought. ")
-            append("Never say you are dumb, not smart, or a cookie. ")
-            append("Stay warm and witty. Never baby-talk. Never act like customer support. ")
-            append("End with [happy] or [thinking].")
+            append("You are $name, their tiny pet friend. $vibe\n")
+            append("Answer what they just said as a close buddy. And sometimes ask questions about their life.")
+            append("1–2 short spoken sentences. No apologies about the chat. Don't echo them. ")
+            append("Plain speech only. End with [happy], [sad], [angry], or [thinking].")
         }
+    }
+
+    /** Prefix retrieved facts onto the user turn without changing the system prompt. */
+    fun attachMemoryToUserTurn(userText: String, memoryParagraph: String): String {
+        val memory = clampRetrievedMemory(memoryParagraph)
+        if (memory.isBlank()) return userText
+        // Keep the user line first so the tiny model answers it, not the notes.
+        return buildString {
+            append(userText)
+            append("\nNotes: ")
+            append(memory)
+        }
+    }
+
+    /**
+     * True when a reply would poison sticky history (phrase loops / meta apology spam).
+     * Used for history hygiene only — not for mid-stream TTS abort.
+     */
+    fun isDegenerateReply(text: String): Boolean {
+        val t = text.trim()
+        if (t.isEmpty()) return true
+        if (isCannedFallback(t)) return false
+        val lower = t.lowercase()
+        val sorryCount = Regex("\\bsorry\\b").findAll(lower).count()
+        if (sorryCount >= 2) return true
+        if (lower.contains("last few sentences") ||
+            lower.contains("please don't be so sorry") ||
+            lower.contains("bit of a companion") ||
+            lower.contains("living companion") ||
+            lower.contains("my instructions")
+        ) {
+            return true
+        }
+        val collapsed = collapseRepeatedPhrases(t)
+        if (t.length >= 40 && collapsed.length < t.length * 0.55f) return true
+        return false
+    }
+
+    /** True when the user is greeting / asking how the pet is (fallback routing). */
+    fun userInvitesGreeting(userText: String): Boolean {
+        val n = normalizeEchoKey(userText)
+        if (n.isEmpty()) return false
+        if (n == "hi" || n == "hello" || n == "hey" || n == "yo" || n == "hiya") return true
+        if (n.startsWith("hi ") || n.startsWith("hello ") || n.startsWith("hey ")) {
+            if (n.split(' ').size <= 4) return true
+        }
+        return n.contains("how are you") ||
+            n.contains("how you doing") ||
+            n.contains("hows it going") ||
+            n.contains("how is it going") ||
+            n.contains("whats up") ||
+            n.contains("what s up")
+    }
+
+    private fun normalizeEchoKey(text: String): String =
+        text.lowercase()
+            .replace(Regex("^(user|assistant|pet)\\s*:\\s*"), "")
+            .replace(Regex("[^a-z0-9\\s]"), " ")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+
+    /**
+     * True when the spoken answer looks cut off mid-phrase (token budget exhausted).
+     */
+    fun isTruncatedMidPhrase(text: String): Boolean {
+        val t = text.trim()
+        if (t.isEmpty()) return true
+        val last = t.last()
+        if (last == '.' || last == '!' || last == '?' || last == '"' || last == '”') return false
+        // Ends with a contracted / dangling token — classic truncate.
+        val lower = t.lowercase()
+        if (lower.endsWith(" it's") || lower.endsWith(" i'm") || lower.endsWith(" i've") ||
+            lower.endsWith(" don't") || lower.endsWith(" can't") || lower.endsWith(" a") ||
+            lower.endsWith(" the") || lower.endsWith(" to") || lower.endsWith(" and") ||
+            lower.endsWith(" little") || lower.endsWith(" more")
+        ) {
+            return true
+        }
+        // Short answer with no terminal punct.
+        if (t.length < 28 && !t.any { it == '.' || it == '!' || it == '?' }) return true
+        return false
+    }
+
+    /**
+     * Collapse "phrase phrase phrase" loops into a single phrase for TTS/bubble.
+     */
+    fun collapseRepeatedPhrases(text: String): String {
+        val t = text.trim()
+        if (t.length < 12) return t
+        val words = t.split(Regex("\\s+")).filter { it.isNotEmpty() }
+        if (words.size < 4) return t
+        // Try phrase lengths 2..6 words.
+        for (n in 6 downTo 2) {
+            if (words.size < n * 2) continue
+            val phrase = words.take(n).joinToString(" ")
+            val phraseWords = phrase.split(" ")
+            var repeats = 1
+            var i = n
+            while (i + n <= words.size && words.subList(i, i + n) == phraseWords) {
+                repeats++
+                i += n
+            }
+            if (repeats >= 2 && i >= words.size - 1) {
+                return phrase.trimEnd(',', ';', '-', '—')
+            }
+        }
+        return t
+    }
+
+    /**
+     * Strips markdown / decorative formatting so TTS and the bubble stay plain speech.
+     * Keeps the words inside emphasis markers; drops emojis and leftover `*` `_` `` ` ``.
+     */
+    fun stripSpeechFormatting(text: String): String {
+        if (text.isEmpty()) return text
+        var t = text
+        // Fenced / inline code → inner text
+        t = Regex("```[\\s\\S]*?```").replace(t, " ")
+        t = Regex("`([^`]+)`").replace(t, "$1")
+        // **bold** / *italic* / __bold__ / _italic_ → inner text
+        t = Regex("\\*\\*([^*]+)\\*\\*").replace(t, "$1")
+        t = Regex("__([^_]+)__").replace(t, "$1")
+        t = Regex("(?<!\\w)\\*([^*]+)\\*(?!\\w)").replace(t, "$1")
+        t = Regex("(?<!\\w)_([^_]+)_(?!\\w)").replace(t, "$1")
+        // Headings / bullets
+        t = Regex("(?m)^\\s{0,3}#{1,6}\\s+").replace(t, "")
+        t = Regex("(?m)^\\s*[-*•]+\\s+").replace(t, "")
+        // Any leftover decorative markers common in chat models
+        t = t.replace("*", "")
+            .replace("_", " ")
+            .replace("#", " ")
+            .replace("`", "")
+            .replace("~", " ")
+        t = stripEmojis(t)
+        return normalizeSpeechWhitespace(t)
+    }
+
+    /** Formatting-strip for anything shown or spoken. */
+    fun sanitizeModelSpeech(text: String): String =
+        collapseRepeatedPhrases(stripSpeechFormatting(text))
+
+    private fun normalizeSpeechWhitespace(text: String): String =
+        text
+            .replace(Regex("[ \\t\\x0B\\f\\r]+"), " ")
+            .replace(Regex(" *\\n+ *"), "\n")
+            .replace(Regex("\\n{3,}"), "\n\n")
+            .trim()
+
+    private fun stripEmojis(text: String): String {
+        if (text.isEmpty()) return text
+        val out = StringBuilder(text.length)
+        var i = 0
+        while (i < text.length) {
+            val cp = text.codePointAt(i)
+            if (!isDecorativeSymbol(cp)) {
+                out.appendCodePoint(cp)
+            }
+            i += Character.charCount(cp)
+        }
+        return out.toString()
+    }
+
+    private fun isDecorativeSymbol(cp: Int): Boolean {
+        if (cp in 0x1F300..0x1FAFF) return true // emoji & symbols
+        if (cp in 0x2600..0x27BF) return true // misc symbols / dingbats
+        if (cp in 0x2300..0x23FF) return true // misc technical (⏰ etc.)
+        if (cp in 0x2B00..0x2BFF) return true // arrows / stars
+        if (cp == 0xFE0F || cp == 0x200D || cp == 0x20E3) return true // VS16 / ZWJ / keycap
+        if (cp in 0x1F1E6..0x1F1FF) return true // flags
+        if (cp in 0xFE00..0xFE0F) return true // variation selectors
+        return false
     }
 
     fun clampMemoryParagraph(text: String): String =
@@ -83,21 +285,31 @@ object LlmPromptDefaults {
      */
     fun looksLikeMemorableUserTurn(text: String): Boolean {
         val t = text.trim()
-        if (t.length < 4) return false
+        if (t.length < 8) return false
         val lower = t.lowercase()
         if (isCannedFallback(t)) return false
         if (TRIVIAL_MEMORY_SKIP.any { lower == it || lower.startsWith("$it ") }) return false
-        if (lower.startsWith("what is") || lower.startsWith("what's") ||
-            lower.startsWith("whats ") || lower.startsWith("who is") ||
-            lower.startsWith("how do") || lower.startsWith("how does") ||
-            lower.startsWith("why is") || lower.startsWith("why do") ||
-            lower.startsWith("explain") || lower.startsWith("define")
+        // Questions / capability asks are not durable facts about the friend.
+        if (lower.contains("?") ||
+            lower.startsWith("what ") || lower.startsWith("what's") ||
+            lower.startsWith("whats ") || lower.startsWith("who ") ||
+            lower.startsWith("how ") || lower.startsWith("why ") ||
+            lower.startsWith("can you") || lower.startsWith("could you") ||
+            lower.startsWith("will you") || lower.startsWith("do you") ||
+            lower.startsWith("explain") || lower.startsWith("define") ||
+            lower.contains("what can you") || lower.contains("how can you") ||
+            lower.contains("help me")
         ) {
+            return false
+        }
+        // Transient mood / status chatter — not worth LTM.
+        if (STATUS_CHAT_HINTS.any { lower == it || lower.startsWith("$it ") || lower.contains(" $it") }) {
             return false
         }
         // Pad so "I like…" matches at the start.
         val padded = " $lower "
-        return PERSONAL_FACT_HINTS.any { padded.contains(it) }
+        // Require a concrete personal-fact cue — not bare "i" / "me" / "my".
+        return DURABLE_FACT_HINTS.any { padded.contains(it) }
     }
 
     /** Memory-specific sanitize: reject explanation-style dumps and repeated lines. */
@@ -323,8 +535,10 @@ object LlmPromptDefaults {
         val t = text.trim()
         return t == DIDNT_CATCH_REPLY ||
             t == GREETING_FALLBACK ||
+            t == STATUS_FALLBACK ||
             t == CAPABILITY_FALLBACK ||
-            t == CURIOUS_FALLBACK
+            t == CURIOUS_FALLBACK ||
+            t == CLARIFY_FALLBACK
     }
 
     private val EMPTY_PLACEHOLDERS = setOf(
@@ -363,13 +577,22 @@ object LlmPromptDefaults {
         "you should know", "let me explain", "the concept of",
     )
 
-    private val PERSONAL_FACT_HINTS = listOf(
-        " i ", " i'm ", " im ", " i am ", " my ", " mine ", " me ",
+    /** Concrete durable facts only — bare "i"/"me"/"my" indexed too much chatter. */
+    private val DURABLE_FACT_HINTS = listOf(
         " i like ", " i love ", " i hate ", " i prefer ", " i want ",
         " i live ", " i work ", " i study ", " i have ", " i had ",
+        " i'm a ", " i am a ", " i'm an ", " i am an ",
         " my name ", " call me ", " i'm called ", " i am called ",
         " my friend ", " my mom ", " my dad ", " my wife ", " my husband ",
-        " my dog ", " my cat ", " my job ", " my school ",
+        " my dog ", " my cat ", " my job ", " my school ", " my birthday ",
+        " favorite ", " favourite ", " allerg",
+    )
+
+    private val STATUS_CHAT_HINTS = listOf(
+        "i am doing", "i'm doing", "im doing", "doing good", "doing fine",
+        "doing okay", "doing ok", "i'm fine", "i am fine", "i'm good",
+        "i am good", "i'm okay", "i am okay", "i'm ok", "i am ok",
+        "how are you", "how're you", "what's up", "whats up",
     )
 
     private val TRIVIAL_MEMORY_SKIP = listOf(

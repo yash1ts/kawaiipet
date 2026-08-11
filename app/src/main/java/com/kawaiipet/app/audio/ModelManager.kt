@@ -187,6 +187,7 @@ class ModelManager(private val context: Context) {
             ?.filter { f -> f.isFile && f.name.endsWith(".onnx", ignoreCase = true) }
             .orEmpty()
         if (onnxFiles.isEmpty()) return null
+        // Prefer fp16/fp32 when both exist; allow int8-only bundles (e.g. kitten v0.8 int8).
         val modelFile = onnxFiles
             .filter { !it.name.contains(".int8.", ignoreCase = true) }
             .maxByOrNull { it.length() }

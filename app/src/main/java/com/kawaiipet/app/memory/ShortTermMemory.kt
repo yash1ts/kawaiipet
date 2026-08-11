@@ -18,7 +18,6 @@ class ShortTermMemory @Inject constructor() {
     fun addMessage(message: ChatMessage) {
         val text = message.text.trim().take(LlmPromptDefaults.MAX_CHARS_PER_TURN)
         if (text.isEmpty()) return
-        if (LlmPromptDefaults.isCannedFallback(text)) return
         messages.add(message.copy(text = text))
         while (messages.size > LlmPromptDefaults.MAX_SHORT_TERM_MESSAGES) {
             messages.removeAt(0)

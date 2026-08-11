@@ -4,6 +4,7 @@ import android.util.Log
 import com.kawaiipet.app.memory.MemoryPipeline
 import com.kawaiipet.app.memory.ShortTermMemory
 import com.kawaiipet.app.pet.PetExpression
+import com.kawaiipet.app.util.DebugSessionLog
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -19,78 +20,174 @@ class ConversationManager @Inject constructor(
         llmService.warmUp()
     }
 
+    suspend fun resetLlmSession() {
+        llmService.resetSession()
+    }
+
+    /**
+     * @param onPartial cumulative display text (emotion tags stripped)
+     * @param onSpeakableSentence complete sentence ready for TTS — fires mid-generation
+     */
     suspend fun processUserInput(
         text: String,
-        onPartial: (String) -> Unit = {},
+        onPartial: suspend (String) -> Unit = {},
+        onSpeakableSentence: suspend (String) -> Unit = {},
     ): LlmResponse {
         if (LlmPromptDefaults.PURE_SMOLLM_DEBUG) {
-            // Pure SmolLM: no short-term / memory, no personality filters — raw model reply.
             shortTermMemory.clear()
             val messages = listOf(ChatMessage(Role.USER, text))
+            val streamer = SpokenSentenceStreamer()
             val rawResponse = llmService.chat(
                 messages = messages,
                 memoryParagraph = "",
-                onPartial = onPartial,
+                onPartial = { partial ->
+                    val display = sanitizeForDisplay(partial)
+                    onPartial(display)
+                    for (s in streamer.consume(display)) {
+                        onSpeakableSentence(s)
+                    }
+                },
             )
             val (cleanText, expression) = parseEmotionTag(rawResponse)
             val spoken = cleanText.trim().ifBlank { rawResponse.trim() }
-            Log.d(
-                TAG,
-                "PURE_SMOLLM_DEBUG raw (${rawResponse.length}): ${rawResponse.toOneLineLog()} " +
-                    "→ spoken=${spoken.toOneLineLog()}",
-            )
+            for (s in streamer.flush(spoken)) {
+                onSpeakableSentence(s)
+            }
+            if (!streamer.hasEmitted && spoken.isNotBlank()) {
+                onSpeakableSentence(spoken)
+            }
             return LlmResponse(spoken, expression)
         }
 
         shortTermMemory.addMessage(ChatMessage(Role.USER, text))
         val messages = shortTermMemory.getMessages()
-        val memoryContext = memoryPipeline.retrieveForChat(text)
+        // Never block TTFT on LTM retrieval — index still happens after the turn.
+        val memoryContext = ""
+
+        val streamer = SpokenSentenceStreamer()
+        var lastDisplay = ""
 
         var rawResponse = llmService.chat(
             messages = messages,
             memoryParagraph = memoryContext,
-            onPartial = onPartial,
+            onPartial = { partial ->
+                val display = sanitizeForDisplay(partial)
+                lastDisplay = display
+                // Bubble updates on every token growth.
+                onPartial(display)
+                for (s in streamer.consume(display, text)) {
+                    Log.d(TAG, "stream sentence: ${s.toOneLineLog()}")
+                    onSpeakableSentence(s)
+                }
+            },
         )
+        // #region agent log
+        DebugSessionLog.log(
+            hypothesisId = "B",
+            location = "ConversationManager.afterChat",
+            message = "llm raw complete",
+            data = mapOf(
+                "rawLen" to rawResponse.length,
+                "raw" to rawResponse.take(280).replace('\n', ' '),
+                "streamed" to streamer.hasEmitted,
+                "lastDisplay" to lastDisplay.take(200),
+            ),
+            runId = "chat-fix",
+        )
+        // #endregion
         Log.d(TAG, "llm raw (${rawResponse.length} chars): ${rawResponse.toOneLineLog()}")
 
-        // If it regurgitates a canned line, retry once without history.
-        if (isStuckOnCanned(rawResponse)) {
-            Log.w(TAG, "Model stuck on canned line — retrying once without history")
-            val nudged = listOf(
-                ChatMessage(
-                    Role.USER,
-                    "As a clever companion, answer briefly: ${text.trim().take(LlmPromptDefaults.MAX_CHARS_PER_TURN)}",
-                ),
+        // Retry only if nothing has been spoken yet (streaming already committed audio).
+        val truncatedBeforeRetry = LlmPromptDefaults.isTruncatedMidPhrase(rawResponse)
+        if (!streamer.hasEmitted &&
+            (rawResponse.isBlank() || truncatedBeforeRetry)
+        ) {
+            Log.w(
+                TAG,
+                "Model returned blank/truncated with no streamed speech — retrying once",
             )
+            DebugSessionLog.log(
+                hypothesisId = "B",
+                location = "ConversationManager.retry",
+                message = "retry after blank/truncated",
+                data = mapOf(
+                    "raw" to rawResponse.take(120),
+                    "truncated" to truncatedBeforeRetry,
+                ),
+                runId = "chat-fix",
+            )
+            // Rebuild sticky from ShortTermMemory, then retry the original turn (no nudge).
+            llmService.resetSession()
             rawResponse = llmService.chat(
-                messages = nudged,
+                messages = messages,
                 memoryParagraph = memoryContext,
+                onPartial = { partial ->
+                    val display = sanitizeForDisplay(partial)
+                    lastDisplay = display
+                    onPartial(display)
+                    for (s in streamer.consume(display, text)) {
+                        onSpeakableSentence(s)
+                    }
+                },
             )
             Log.d(TAG, "llm retry (${rawResponse.length} chars): ${rawResponse.toOneLineLog()}")
         }
 
-        val (cleanText, parsedExpression) = parseEmotionTag(rawResponse)
-        val qualityChecked = sanitizeModelReply(cleanText, text)
-        val spokenText = ensureSpeakable(qualityChecked, rawResponse, text)
+        val spokenRaw = rawResponse
+        val (cleanText, parsedExpression) = parseEmotionTag(spokenRaw)
+        val qualityChecked = sanitizeModelReply(
+            LlmPromptDefaults.collapseRepeatedPhrases(cleanText),
+            text,
+        )
+        // Prefer the model reply; only fall back when there's nothing usable.
+        var spokenText = when {
+            qualityChecked.isNotBlank() -> qualityChecked
+            streamer.hasEmitted -> lastDisplay.trim().ifBlank { cleanText.trim() }
+            else -> ensureSpeakable(cleanText, rawResponse, text)
+        }.ifBlank { ensureSpeakable("", rawResponse, text) }
+
+        // History poison from loops (seen in device logs) — swap to fallback and reset KV.
+        if (LlmPromptDefaults.isDegenerateReply(spokenText) ||
+            LlmPromptDefaults.isDegenerateReply(cleanText)
+        ) {
+            Log.w(TAG, "Degenerate reply — fallback + reset sticky: ${spokenText.toOneLineLog()}")
+            llmService.resetSession()
+            spokenText = fallbackForUser(text, rawResponse)
+        }
+
         val expression = when {
             spokenText == LlmPromptDefaults.DIDNT_CATCH_REPLY -> PetExpression.THINKING
             LlmPromptDefaults.isCannedFallback(spokenText) -> PetExpression.HAPPY
             else -> parsedExpression
         }
-        Log.d(
+
+        if (streamer.hasEmitted && !LlmPromptDefaults.isCannedFallback(spokenText)) {
+            val flushSource = when {
+                spokenText.isNotBlank() -> spokenText
+                else -> lastDisplay.ifBlank { cleanText }
+            }
+            for (s in streamer.flush(flushSource, text)) {
+                onSpeakableSentence(s)
+            }
+        } else if (!streamer.hasEmitted && spokenText.isNotBlank()) {
+            onSpeakableSentence(spokenText)
+        }
+
+        Log.i(
             TAG,
             "llm parsed: expression=$expression cleanLen=${cleanText.length} " +
                 "clean=${cleanText.toOneLineLog()} → spokenLen=${spokenText.length} " +
-                "spoken=${spokenText.toOneLineLog()}",
+                "spoken=${spokenText.toOneLineLog()} streamed=${streamer.hasEmitted}",
         )
 
-        // Never store canned/failed lines — they train the next copy loop.
-        if (LlmPromptDefaults.isCannedFallback(spokenText)) {
-            shortTermMemory.removeLastUserMessage()
-        } else {
+        if (spokenText.isNotBlank() && !LlmPromptDefaults.isDegenerateReply(spokenText)) {
             shortTermMemory.addMessage(ChatMessage(Role.ASSISTANT, spokenText))
-            // Index memorable facts on background IO — do not block the reply path.
-            memoryPipeline.scheduleIndexTurn(text, spokenText)
+            if (!LlmPromptDefaults.isCannedFallback(spokenText)) {
+                memoryPipeline.scheduleIndexTurn(text, spokenText)
+            }
+        } else if (LlmPromptDefaults.isCannedFallback(spokenText)) {
+            // Keep a short canned line so the next turn has something coherent.
+            shortTermMemory.addMessage(ChatMessage(Role.ASSISTANT, spokenText))
         }
 
         return LlmResponse(spokenText, expression)
@@ -98,6 +195,12 @@ class ConversationManager @Inject constructor(
 
     fun clearConversation() {
         shortTermMemory.clear()
+    }
+
+    /** Clears short-term chat and drops the sticky LiteRT conversation / KV cache. */
+    suspend fun clearConversationFully() {
+        shortTermMemory.clear()
+        llmService.resetSession()
     }
 
     private fun ensureSpeakable(
@@ -121,113 +224,63 @@ class ConversationManager @Inject constructor(
         Log.w(TAG, "Fallback (raw=${rawResponse.take(120).replace('\n', ' ')})")
         return when {
             isCapabilityQuestion(userText) -> LlmPromptDefaults.CAPABILITY_FALLBACK
+            isHowAreYou(userText) -> LlmPromptDefaults.GREETING_FALLBACK
+            isStatusUpdate(userText) -> LlmPromptDefaults.STATUS_FALLBACK
             isTrivialTurn(userText) -> LlmPromptDefaults.GREETING_FALLBACK
+            isClarifyRequest(userText) -> LlmPromptDefaults.CLARIFY_FALLBACK
             isWhatIsQuestion(userText) -> LlmPromptDefaults.CURIOUS_FALLBACK
             else -> LlmPromptDefaults.CURIOUS_FALLBACK
         }
     }
 
+    /** Vague asks like "remind me" / "help me" with no object — pet should ask what. */
+    private fun isClarifyRequest(text: String): Boolean {
+        val lower = text.lowercase().trim().trimEnd('.', '!', '?')
+        if (lower in setOf(
+                "remind me", "remember that", "help me", "help", "do it",
+                "okay then remind me", "ok then remind me", "okay remind me",
+                "okay then, remind me", "ok then, remind me",
+            )
+        ) return true
+        if (lower.startsWith("remind me") && lower.length < 28) return true
+        if (lower.startsWith("help me") && lower.length < 18) return true
+        return false
+    }
+
     private fun sanitizeModelReply(text: String, userText: String): String {
-        var cleaned = extractSpokenCore(text, userText)
+        val cleaned = extractSpokenCore(text, userText)
         if (cleaned.isEmpty()) {
             Log.w(TAG, "No salvageable sentence from: ${text.take(80)}")
-            return ""
-        }
-        if (isNarration(cleaned) || isMetaInstruction(cleaned) || isAssistantDump(cleaned) ||
-            isAssistantDump(text) || isStuckOnCanned(cleaned) || isSelfDeprecatingPet(cleaned)
-        ) {
-            Log.w(TAG, "Rejected bad reply: ${cleaned.take(80)}")
-            return ""
-        }
-        if (isUserEcho(cleaned, userText)) {
-            Log.w(TAG, "Rejected user echo: ${cleaned.take(80)}")
             return ""
         }
         return cleaned
     }
 
     /**
-     * Tiny models derail on words like "cookie" into idioms ("I'm not a smart cookie")
-     * that fight the clever-companion persona.
+     * Light cleanup only — keep the model reply, strip role labels / emotion scaffolding.
      */
-    private fun isSelfDeprecatingPet(text: String): Boolean {
-        val lower = text.lowercase()
-        return listOf(
-            "smart cookie",
-            "not a smart",
-            "i'm not smart",
-            "im not smart",
-            "i am not smart",
-            "i'm dumb",
-            "im dumb",
-            "i am dumb",
-            "not very smart",
-            "just a dumb",
-            "dumb pet",
-            "i'm not clever",
-            "im not clever",
-            "i'm not very clever",
-        ).any { lower.contains(it) }
-    }
-
-    /** Exact or near-verbatim repeat of what the friend just said. */
-    private fun isUserEcho(reply: String, userText: String): Boolean {
-        val r = normalizeForCompare(reply)
-        val u = normalizeForCompare(userText)
-        if (r.isEmpty() || u.isEmpty()) return false
-        if (r == u) return true
-        // Reply is just the user line with a tiny tag/prefix stripped or added.
-        if (r.length >= 4 && (u.contains(r) || r.contains(u))) {
-            val shorter = minOf(r.length, u.length).toFloat()
-            val longer = maxOf(r.length, u.length).toFloat()
-            if (shorter / longer >= 0.85f) return true
-        }
-        val rTokens = r.split(' ').filter { it.length > 1 }.toSet()
-        val uTokens = u.split(' ').filter { it.length > 1 }.toSet()
-        if (rTokens.size >= 3 && uTokens.size >= 3) {
-            val overlap = rTokens.intersect(uTokens).size.toFloat()
-            val union = rTokens.union(uTokens).size.toFloat().coerceAtLeast(1f)
-            if (overlap / union >= 0.85f) return true
-        }
-        return false
-    }
-
     private fun extractSpokenCore(raw: String, lastUser: String): String {
         var t = raw.trim()
         if (t.isEmpty()) return ""
 
         t = stripRolePrefixes(t)
         if (lastUser.isNotBlank()) t = stripLeadingEcho(t, lastUser)
-        t = takeBeforeMeta(t)
-
-        val quoted = Regex("\"([^\"]{3,120})\"").find(t)
-        if (quoted != null) {
-            val inner = quoted.groupValues[1].trim()
-            if (!isMetaInstruction(inner) && !isNarration(inner) && !isAssistantDump(inner)) {
-                return inner
-            }
-        }
-
         t = t.trim().trim('"').trim()
-        val parts = t.split(Regex("(?<=[.!?])[\"']?\\s+"))
-            .map { it.trim().trim('"').trim() }
-            .filter { it.isNotEmpty() }
+        if (t.isEmpty()) return ""
 
-        for (part in parts) {
-            val sentence = stripRolePrefixes(part).trim().trim('"')
-            if (sentence.any { it.isLetterOrDigit() } &&
-                !isNarration(sentence) &&
-                !isMetaInstruction(sentence) &&
-                !isAssistantDump(sentence)
-            ) {
-                return sentence
+        val parts = t.split(Regex("(?<=[.!?])[\"']?\\s+"))
+            .map { stripRolePrefixes(it).trim().trim('"').trim() }
+            .filter { it.isNotEmpty() && it.any { ch -> ch.isLetterOrDigit() } }
+
+        if (parts.isEmpty()) {
+            return if (t.length in 3..LlmPromptDefaults.MAX_SPOKEN_CHARS) {
+                t
+            } else {
+                t.take(LlmPromptDefaults.MAX_SPOKEN_CHARS)
             }
         }
-        // Allow a short single-clause reply without trailing punctuation.
-        if (t.length in 3..120 && !isAssistantDump(t) && !isMetaInstruction(t) && !isNarration(t)) {
-            return t
-        }
-        return ""
+
+        return parts.take(LlmPromptDefaults.MAX_REPLY_SENTENCES).joinToString(" ").trim()
     }
 
     private fun stripRolePrefixes(text: String): String {
@@ -257,62 +310,34 @@ class ConversationManager @Inject constructor(
         return r
     }
 
-    private fun takeBeforeMeta(text: String): String {
-        val trimmed = text.trim()
-        if (trimmed.isEmpty()) return ""
-        val lower = trimmed.lowercase()
-        if (lower.startsWith("the user") || lower.startsWith("here are") ||
-            lower.startsWith("remember")
-        ) {
-            return ""
-        }
-        val cutMarkers = listOf(
-            " here are", "\nhere are", " remember to", "\nremember",
-            " emotion tag", "\nemotion", " the user", "\nthe user",
-            " i can help with", "\ni can help", "\n*", " * ", "\n-",
-            " - happy", " - sad", " - thinking",
-        )
-        var cutAt = trimmed.length
-        for (marker in cutMarkers) {
-            val idx = lower.indexOf(marker)
-            if (idx >= 0) cutAt = minOf(cutAt, idx)
-        }
-        return trimmed.take(cutAt).trim().trimEnd('.', '!', '?', '"', '\'').trim()
-    }
-
-    private fun isStuckOnCanned(text: String): Boolean {
-        val n = normalizeForCompare(text)
-        if (n.isEmpty()) return false
-        return listOf(
-            LlmPromptDefaults.CAPABILITY_FALLBACK,
-            LlmPromptDefaults.GREETING_FALLBACK,
-            LlmPromptDefaults.DIDNT_CATCH_REPLY,
-            LlmPromptDefaults.CURIOUS_FALLBACK,
-        ).any { normalizeForCompare(it) == n || n.startsWith(normalizeForCompare(it).take(24)) }
-    }
-
     private fun isMetaInstruction(text: String): Boolean {
         val lower = text.lowercase()
         return listOf(
-            "here are", "remember to", "emotion tag", "respond in first",
+            "remember to", "emotion tag", "respond in first",
             "some tags", "finish with", "reply rules",
         ).any { lower.contains(it) }
     }
 
     private fun isAssistantDump(text: String): Boolean {
         val lower = text.lowercase()
-        if (lower.contains('*') || Regex("\\n\\s*[-•]").containsMatchIn(text)) return true
+        // Lists / markdown dumps — not short companion lines like "I'm here to help!".
+        if (Regex("\\n\\s*[-•]").containsMatchIn(text)) return true
+        if (lower.count { it == '*' } >= 2) return true
         return listOf(
-            "i can help with",
-            "i'm here to help",
-            "i am here to help",
-            "feel free to ask",
             "travel planning",
             "travel tips",
-            "booking",
             "itinerar",
             "customer support",
             "how can i assist",
+            "how may i assist",
+            "feel free to ask me anything",
+            "feel free to ask",
+            "here to help you with any",
+            "here to help with any",
+            "any questions or problems",
+            "questions or concerns",
+            "i'm happy to help you with",
+            "i am happy to help you with",
         ).any { lower.contains(it) }
     }
 
@@ -320,7 +345,33 @@ class ConversationManager @Inject constructor(
         val lower = text.lowercase()
         return lower.contains("what can you") ||
             lower.contains("what do you do") ||
-            (lower.contains("can you do") && lower.length < 48)
+            lower.contains("how can you help") ||
+            lower.contains("how do you help") ||
+            lower.contains("how can you assist") ||
+            lower.contains("what are you for") ||
+            (lower.contains("can you do") && lower.length < 48) ||
+            (lower.contains("help me") && lower.length < 28 && !lower.contains("remind"))
+    }
+
+    private fun isHowAreYou(text: String): Boolean =
+        LlmPromptDefaults.userInvitesGreeting(text) &&
+            normalizeForCompare(text).let { n ->
+                n.contains("how are you") ||
+                    n.contains("how you doing") ||
+                    n.contains("hows it going") ||
+                    n.contains("whats up")
+            }
+
+    /** User shared how they feel ("I'm good", "doing fine") — don't ask how are you again. */
+    private fun isStatusUpdate(text: String): Boolean {
+        val n = normalizeForCompare(text)
+        if (n.isEmpty() || n.length > 40) return false
+        return n.contains("i am good") || n.contains("i m good") || n.contains("im good") ||
+            n.contains("i am fine") || n.contains("i m fine") || n.contains("im fine") ||
+            n.contains("doing good") || n.contains("doing fine") || n.contains("doing okay") ||
+            n.contains("doing ok") || n.contains("i am okay") || n.contains("i m okay") ||
+            n.contains("i am great") || n.contains("i m great") ||
+            n == "good" || n == "fine" || n == "okay" || n == "ok" || n == "great"
     }
 
     private fun isWhatIsQuestion(text: String): Boolean {
@@ -331,13 +382,6 @@ class ConversationManager @Inject constructor(
             lower.contains("what are")
     }
 
-    private fun isNarration(text: String): Boolean {
-        val lower = text.lowercase().trim()
-        return lower.startsWith("the user") ||
-            lower.contains("the user is ") ||
-            lower.contains("the user was ")
-    }
-
     private fun normalizeForCompare(text: String): String =
         text.lowercase()
             .replace(Regex("^(user|assistant|pet)\\s*:\\s*"), "")
@@ -346,18 +390,32 @@ class ConversationManager @Inject constructor(
             .trim()
 
     private fun clampSpokenLength(text: String): String {
+        // Keep all lines; only normalize whitespace. Hard word cut is a last-resort safety net.
         val collapsed = text
-            .lineSequence()
-            .map { it.trim() }
-            .filter { it.isNotEmpty() }
-            .firstOrNull()
-            .orEmpty()
+            .replace(Regex("[\\t\\r\\n]+"), " ")
             .replace(Regex("\\s+"), " ")
             .trim()
             .trim('"')
+        if (collapsed.length > LlmPromptDefaults.MAX_SPOKEN_CHARS) {
+            return softCutAtSentence(collapsed, LlmPromptDefaults.MAX_SPOKEN_CHARS)
+        }
         val words = collapsed.split(' ').filter { it.isNotEmpty() }
         if (words.size <= LlmPromptDefaults.MAX_REPLY_WORDS) return collapsed
-        return words.take(LlmPromptDefaults.MAX_REPLY_WORDS).joinToString(" ").trimEnd(',', ';', ':')
+        return softCutAtSentence(
+            words.take(LlmPromptDefaults.MAX_REPLY_WORDS).joinToString(" "),
+            LlmPromptDefaults.MAX_SPOKEN_CHARS,
+        )
+    }
+
+    /** Prefer ending on .!? near [maxChars] instead of mid-word. */
+    private fun softCutAtSentence(text: String, maxChars: Int): String {
+        if (text.length <= maxChars) return text.trimEnd(',', ';', ':')
+        val window = text.take(maxChars)
+        val lastStop = window.indexOfLast { it == '.' || it == '!' || it == '?' }
+        if (lastStop >= maxChars / 3) {
+            return window.take(lastStop + 1).trim()
+        }
+        return window.trimEnd(',', ';', ':', ' ').trim()
     }
 
     companion object {
@@ -383,16 +441,20 @@ class ConversationManager @Inject constructor(
         private val TRAILING_PARTIAL_TAG_REGEX = "\\[[^\\]]*$".toRegex()
 
         fun sanitizeForDisplay(partialRaw: String): String =
-            partialRaw
+            LlmPromptDefaults.sanitizeModelSpeech(partialRaw)
                 .replace(EMOTION_TAG_REGEX, "")
                 .replace(TRAILING_PARTIAL_TAG_REGEX, "")
                 .trim()
 
         fun parseEmotionTag(response: String): Pair<String, PetExpression> {
-            val match = EMOTION_TAG_REGEX.findAll(response).lastOrNull()
+            // Keep emotion tags until after match; strip markdown/emoji around them.
+            val forTags = response
+            val match = EMOTION_TAG_REGEX.findAll(forTags).lastOrNull()
             val expression = match?.groupValues?.get(1)?.let { PetExpression.fromTag(it) }
                 ?: PetExpression.HAPPY
-            val cleanText = response.replace(EMOTION_TAG_REGEX, "").trim()
+            val cleanText = LlmPromptDefaults.stripSpeechFormatting(
+                forTags.replace(EMOTION_TAG_REGEX, ""),
+            )
             return cleanText to expression
         }
     }

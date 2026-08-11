@@ -122,6 +122,12 @@ android {
             useLegacyPackaging = false
             // Safety net if another AAR also ships ORT.
             pickFirsts += "**/libonnxruntime.so"
+            // localagents-rag ships unused native embedders/chunkers; we use MiniLmEmbedder + SqliteVectorStore only.
+            excludes += listOf(
+                "**/libgemma_embedding_model_jni.so",
+                "**/libgecko_embedding_model_jni.so",
+                "**/libtext_chunker_jni.so",
+            )
         }
     }
 
@@ -131,7 +137,8 @@ android {
 // We strip its bundled libonnxruntime.so and use onnxruntime-android instead so MiniLM
 // can use the Java ORT API (libonnxruntime4j_jni.so). Keep ORT >= 1.22 for 16KB JNI.
 // https://github.com/k2-fsa/sherpa-onnx/releases
-private val sherpaOnnxReleaseVersion = "1.12.35"
+// 1.13.4+ required for KittenTTS v0.8 (style_dim rows / max_token_len=400).
+private val sherpaOnnxReleaseVersion = "1.13.4"
 private val sherpaOnnxAarFile = layout.projectDirectory.file("libs/sherpa-onnx-$sherpaOnnxReleaseVersion.aar")
 private val sherpaOnnxAppAarFile = layout.projectDirectory.file("libs/sherpa-onnx-$sherpaOnnxReleaseVersion-app.aar")
 

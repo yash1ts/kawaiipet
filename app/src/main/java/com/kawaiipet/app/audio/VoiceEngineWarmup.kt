@@ -6,7 +6,6 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -29,14 +28,14 @@ class VoiceEngineWarmup @Inject constructor(
                 Log.d(TAG, "No voice models on disk yet; skipping engine warmup")
                 return@launch
             }
-            withContext(Dispatchers.Default) {
-                if (loadStt) {
-                    Log.d(TAG, "Warmup STT id=$sttId ok=${audioPipeline.initializeSTT(sttId)}")
-                }
-                if (loadTts) {
-                    Log.d(TAG, "Warmup TTS id=$ttsId ok=${audioPipeline.initializeTTS(ttsId)}")
-                }
-            }
+            // Same prepare job as the overlay — no concurrent release()/re-init race.
+            audioPipeline.schedulePetVoiceModelPrepare(
+                scope = scope,
+                sttId = sttId,
+                ttsId = ttsId,
+                loadStt = loadStt,
+                loadTts = loadTts,
+            )
         }
     }
 

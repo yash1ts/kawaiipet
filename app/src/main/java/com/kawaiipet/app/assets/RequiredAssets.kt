@@ -7,8 +7,9 @@ import com.kawaiipet.app.audio.DefaultVoiceModels
  */
 object RequiredAssets {
 
-    const val LLM_MODEL_ID = "smollm2-135m-instruct"
-    const val LLM_FILE_NAME = "SmolLM2_135M_Instruct.litertlm"
+    /** SmolLM2-360M Instruct (~374 MiB) via LiteRT-LM — no thinking/CoT mode. */
+    const val LLM_MODEL_ID = "smollm2-360m"
+    const val LLM_FILE_NAME = "SmolLM2_360M_instruct.litertlm"
 
     const val EMBEDDER_MODEL_ID = "all-minilm-l6-v2"
     const val EMBEDDER_ONNX_FILE = "model.onnx"
@@ -17,12 +18,14 @@ object RequiredAssets {
     private const val MINILM_BASE =
         "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main"
 
+    private const val SMOLLM2_LITERT_BASE =
+        "https://huggingface.co/litert-community/SmolLM2-360M-Instruct/resolve/main"
+
     val ALL: List<AssetSpec> = listOf(
         AssetSpec(
             id = LLM_MODEL_ID,
             displayName = "Pet brain",
-            url = "https://huggingface.co/litert-community/SmolLM2-135M-Instruct/resolve/main/" +
-                LLM_FILE_NAME,
+            url = "$SMOLLM2_LITERT_BASE/$LLM_FILE_NAME",
             kind = AssetKind.RawFile(fileName = LLM_FILE_NAME),
         ),
         AssetSpec(

@@ -44,7 +44,7 @@ import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.launch
 import javax.inject.Inject
 
-private val kittenVoiceOptions = listOf(0, 1, 2, 3)
+private val kittenVoiceOptions = listOf(0, 1, 2, 3, 4, 5, 6, 7)
 
 @HiltViewModel
 class CustomizeViewModel @Inject constructor(
@@ -55,11 +55,13 @@ class CustomizeViewModel @Inject constructor(
     val personalityPrompt = prefs.personalityPrompt
     val ttsSpeakerId = prefs.ttsSpeakerId
     val ttsVolume = prefs.ttsVolume
+    val ttsSpeed = prefs.ttsSpeed
 
     suspend fun setPetName(value: String) = prefs.setPetName(value)
     suspend fun setPersonality(value: String) = prefs.setPersonalityPrompt(value)
     suspend fun setSpeakerId(value: Int) = prefs.setTtsSpeakerId(value)
     suspend fun setVolume(value: Float) = prefs.setTtsVolume(value)
+    suspend fun setSpeed(value: Float) = prefs.setTtsSpeed(value)
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -77,7 +79,12 @@ fun CustomizeScreen(
     val petName = petNameEdit ?: petNameSaved
     val personality = personalityEdit ?: personalitySaved
     val speakerId by viewModel.ttsSpeakerId.collectAsState(initial = 1)
-    val volume by viewModel.ttsVolume.collectAsState(initial = 1f)
+    val volume by viewModel.ttsVolume.collectAsState(
+        initial = PreferenceManager.TTS_VOLUME_DEFAULT,
+    )
+    val speed by viewModel.ttsSpeed.collectAsState(
+        initial = PreferenceManager.TTS_SPEED_DEFAULT,
+    )
     val scope = rememberCoroutineScope()
 
     Scaffold(
@@ -168,14 +175,52 @@ fun CustomizeScreen(
 
             Text(stringResource(R.string.tts_volume_label), style = MaterialTheme.typography.labelLarge)
             Text(
-                text = "${(volume * 100).toInt()}%",
+                text = stringResource(R.string.tts_volume_value, (volume * 100).toInt()),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Text(
+                text = stringResource(R.string.tts_volume_hint),
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
             Slider(
-                value = volume,
+                value = volume.coerceIn(
+                    PreferenceManager.TTS_VOLUME_MIN,
+                    PreferenceManager.TTS_VOLUME_MAX,
+                ),
                 onValueChange = { v -> scope.launch { viewModel.setVolume(v) } },
-                valueRange = 0f..1f,
+                valueRange = PreferenceManager.TTS_VOLUME_MIN..PreferenceManager.TTS_VOLUME_MAX,
+            )
+
+            Spacer(modifier = Modifier.height(16.dp))
+
+            Text(stringResource(R.string.tts_speed_label), style = MaterialTheme.typography.labelLarge)
+            Text(
+                text = stringResource(
+                    R.string.tts_speed_value,
+                    String.format("%.1f", speed),
+                ),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Text(
+                text = stringResource(R.string.tts_speed_hint),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Slider(
+                value = speed.coerceIn(
+                    PreferenceManager.TTS_SPEED_MIN,
+                    PreferenceManager.TTS_SPEED_MAX,
+                ),
+                onValueChange = { v ->
+                    val snapped = (kotlin.math.round(v * 10f) / 10f)
+                        .coerceIn(PreferenceManager.TTS_SPEED_MIN, PreferenceManager.TTS_SPEED_MAX)
+                    scope.launch { viewModel.setSpeed(snapped) }
+                },
+                valueRange = PreferenceManager.TTS_SPEED_MIN..PreferenceManager.TTS_SPEED_MAX,
+                steps = ((PreferenceManager.TTS_SPEED_MAX - PreferenceManager.TTS_SPEED_MIN) * 10f).toInt() - 1,
             )
 
             Spacer(modifier = Modifier.height(24.dp))

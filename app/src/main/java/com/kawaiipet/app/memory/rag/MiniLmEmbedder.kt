@@ -38,8 +38,13 @@ class MiniLmEmbedder(
         require(onnxModelFile.isFile) { "Missing MiniLM onnx: ${onnxModelFile.absolutePath}" }
         require(vocabFile.isFile) { "Missing MiniLM vocab: ${vocabFile.absolutePath}" }
         val opts = OrtSession.SessionOptions().apply {
-            setIntraOpNumThreads(2)
+            val threads = Runtime.getRuntime().availableProcessors().coerceIn(4, 8)
+            setIntraOpNumThreads(threads)
+            setInterOpNumThreads(2)
             setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
+            // Prefer XNNPACK — Pixel Darwinn often rejects MiniLM FLOAT32 via NNAPI.
+            runCatching { addXnnpack(emptyMap()) }
+                .onFailure { Log.d(TAG, "MiniLM XNNPACK unavailable — threaded CPU") }
         }
         session = env.createSession(onnxModelFile.absolutePath, opts)
         inputNames = session.inputNames

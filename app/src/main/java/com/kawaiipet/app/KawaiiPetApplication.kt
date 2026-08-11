@@ -5,6 +5,7 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import com.kawaiipet.app.BuildConfig
 import com.kawaiipet.app.audio.VoiceEngineWarmup
+import com.kawaiipet.app.llm.LlmEngineWarmup
 import com.kawaiipet.app.memory.MemoryRepository
 import com.kawaiipet.app.memory.ShortTermMemory
 import com.kawaiipet.app.util.PreferenceManager
@@ -21,6 +22,7 @@ import kotlinx.coroutines.launch
 class KawaiiPetApplication : Application() {
 
     @Inject lateinit var voiceEngineWarmup: VoiceEngineWarmup
+    @Inject lateinit var llmEngineWarmup: LlmEngineWarmup
     @Inject lateinit var memoryRepository: MemoryRepository
     @Inject lateinit var shortTermMemory: ShortTermMemory
     @Inject lateinit var preferenceManager: PreferenceManager
@@ -33,12 +35,14 @@ class KawaiiPetApplication : Application() {
             PostHogAndroid.setup(this, PostHogAndroidConfig(apiKey = apiKey, host = host))
         }
         voiceEngineWarmup.startWarmup()
+        llmEngineWarmup.startWarmup("app_start")
         createNotificationChannel()
         // Drop known contaminated memory lines that made SmolLM loop.
         CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
             runCatching {
                 preferenceManager.migratePersonalityDefaultIfNeeded()
                 preferenceManager.migrateSttModelIfNeeded()
+                preferenceManager.migrateTtsVolumeDefaultIfNeeded()
                 memoryRepository.purgeContaminatedFacts()
                 shortTermMemory.clear()
             }

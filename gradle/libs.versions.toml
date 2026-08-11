@@ -16,7 +16,7 @@ posthog = "3.31.0"
 litertLm = "0.15.0"
 commonsCompress = "1.27.1"
 localagentsRag = "0.3.0"
-onnxruntime = "1.23.2"
+onnxruntime = "1.27.0"
 coroutinesGuava = "1.11.0"
 # Required by localagents-rag SqliteVectorStore (optional tasks-genai otherwise).
 protobufJavalite = "4.28.3"

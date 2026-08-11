@@ -3,6 +3,7 @@ package com.kawaiipet.app.assets
 import android.content.Context
 import android.util.Log
 import com.kawaiipet.app.audio.ModelManager
+import com.kawaiipet.app.llm.LlmEngineWarmup
 import dagger.hilt.android.qualifiers.ApplicationContext
 import java.io.BufferedInputStream
 import java.io.File
@@ -64,6 +65,7 @@ sealed interface AssetDownloadState {
 class AssetDownloadManager @Inject constructor(
     @param:ApplicationContext private val context: Context,
     private val modelManager: ModelManager,
+    private val llmEngineWarmup: LlmEngineWarmup,
 ) {
     private val appScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val mutex = Mutex()
@@ -80,6 +82,7 @@ class AssetDownloadManager @Inject constructor(
     fun refresh() {
         if (activeJob?.isActive == true) return
         _state.value = if (areAllAssetsReady()) {
+            onAssetsReady("refresh")
             AssetDownloadState.Ready
         } else {
             AssetDownloadState.Checking
@@ -90,6 +93,7 @@ class AssetDownloadManager @Inject constructor(
     fun ensureAssetsDownloadedAsync() {
         if (areAllAssetsReady()) {
             _state.value = AssetDownloadState.Ready
+            onAssetsReady("ensure_already")
             return
         }
         if (activeJob?.isActive == true) return
@@ -101,6 +105,7 @@ class AssetDownloadManager @Inject constructor(
     private suspend fun ensureAssetsDownloaded() = mutex.withLock {
         if (areAllAssetsReady()) {
             _state.value = AssetDownloadState.Ready
+            onAssetsReady("ensure_locked")
             return@withLock
         }
 
@@ -117,6 +122,7 @@ class AssetDownloadManager @Inject constructor(
                 error("Assets still incomplete after download")
             }
             _state.value = AssetDownloadState.Ready
+            onAssetsReady("download_complete")
             Log.i(TAG, "All runtime assets ready")
         } catch (t: CancellationException) {
             throw t
@@ -342,6 +348,11 @@ class AssetDownloadManager @Inject constructor(
         is UnknownHostException -> "No internet connection. Connect to Wi‑Fi and retry."
         is SocketTimeoutException -> "Download timed out. Try again on a more stable network."
         else -> t.message?.takeIf { it.isNotBlank() } ?: "Download failed. Please retry."
+    }
+
+    private fun onAssetsReady(reason: String) {
+        // Voice packs + LLM weights are on disk — start engine/sticky preload.
+        llmEngineWarmup.startWarmup("assets_$reason")
     }
 
     companion object {

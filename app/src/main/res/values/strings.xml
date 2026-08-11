@@ -14,8 +14,9 @@
     <string name="overlay_restricted_settings_help_url" translatable="false">https://support.google.com/android/answer/12623953?sjid=3811114255780039092-NC#allowrestrictedsettings</string>
     <string name="overlay_release_to_close">Release here to close</string>
     <string name="settings_title">Settings</string>
+    <string name="settings_voice_section">Voice</string>
     <string name="settings_on_device_ai_section">On-device models</string>
-    <string name="settings_models_summary">Models download on first launch. Chat uses SmolLM2 via LiteRT-LM; voice uses Sherpa-ONNX (Moonshine STT + KittenTTS).</string>
+    <string name="settings_models_summary">Models download on first launch. Chat uses SmolLM2-360M via LiteRT-LM; voice uses Sherpa-ONNX (Moonshine STT + KittenTTS).</string>
     <string name="customize_title">Customize pet</string>
     <string name="home_tagline">Your AI companion, always by your side</string>
     <string name="home_models_ready">Ready — offline brain &amp; voice installed</string>
@@ -44,17 +45,26 @@
     <string name="pet_name_label">Pet name</string>
     <string name="pet_name_hint">Give your pet a name</string>
     <string name="pet_personality_label">Personality</string>
-    <string name="pet_personality_hint">How your pet acts (e.g. shy, energetic, sassy). Keep it short.</string>
+    <string name="pet_personality_hint">Who they are as a friend (e.g. cozy soft buddy, sassy little gremlin). Short lines — not a helper bot.</string>
     <string name="kitten_voice_label">Pet voice</string>
-    <string name="kitten_voice_model_hint">Kitten Nano English v0.2 (kitten-nano-en-v0_2-fp16)</string>
+    <string name="kitten_voice_model_hint">Kitten Nano English 0.8 INT8 (kitten-nano-en-v0_8-int8)</string>
     <string name="kitten_voice_option">Voice %1$d</string>
     <string-array name="kitten_voice_names">
         <item>Soufflé</item>
-        <item>Mochi</item>
+        <item>Bella</item>
         <item>Muffin</item>
+        <item>Mochi</item>
         <item>Pudding</item>
+        <item>Coco</item>
+        <item>Biscuit</item>
+        <item>Nori</item>
     </string-array>
     <string name="tts_volume_label">Speech volume</string>
+    <string name="tts_volume_value">%1$d%%</string>
+    <string name="tts_volume_hint">Default and max are 100%.</string>
+    <string name="tts_speed_label">Voice speed</string>
+    <string name="tts_speed_value">%1$s×</string>
+    <string name="tts_speed_hint">Default is 1.1× for synth and playback.</string>
     <string name="shortcut_start_pet_short">Start pet</string>
     <string name="shortcut_start_pet_long">Start KawaiiPet on screen</string>
     <string name="tile_start_pet_label">Start pet</string>

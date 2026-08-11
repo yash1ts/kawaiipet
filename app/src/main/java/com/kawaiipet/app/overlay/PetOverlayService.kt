@@ -24,7 +24,9 @@ import com.kawaiipet.app.R
 import com.kawaiipet.app.audio.AudioPipeline
 import com.kawaiipet.app.audio.ModelManager
 import com.kawaiipet.app.llm.ConversationManager
+import com.kawaiipet.app.llm.LlmEngineWarmup
 import com.kawaiipet.app.pet.PetAnimationController
+import com.kawaiipet.app.pet.PetBrain
 import com.kawaiipet.app.pet.PetViewModel
 import com.kawaiipet.app.ui.AiTriggerActivity
 import com.kawaiipet.app.ui.MainActivity
@@ -47,6 +49,8 @@ import kotlin.math.roundToInt
 class PetOverlayService : Service() {
 
     @Inject lateinit var conversationManager: ConversationManager
+    @Inject lateinit var petBrain: PetBrain
+    @Inject lateinit var llmEngineWarmup: LlmEngineWarmup
     @Inject lateinit var audioPipeline: AudioPipeline
     @Inject lateinit var modelManager: ModelManager
     @Inject lateinit var preferenceManager: PreferenceManager
@@ -70,6 +74,14 @@ class PetOverlayService : Service() {
     override fun onCreate() {
         super.onCreate()
         startAsForeground()
+
+        // Fresh short-term chat + sticky LiteRT KV for this overlay session,
+        // then immediately re-warm the engine/sticky so the first tap is hot.
+        serviceScope.launch {
+            conversationManager.clearConversationFully()
+            Log.d(TAG, "Short-term memory cleared for new pet session")
+            llmEngineWarmup.startWarmup("overlay_start")
+        }
 
         serviceScope.launch(Dispatchers.IO) {
             modelManager.installBundledModelsIfNeeded()
@@ -104,11 +116,9 @@ class PetOverlayService : Service() {
             } else {
                 Log.w(TAG, "TRIGGER_AI before ViewModel ready")
             }
-        } else {
-            // Fresh short-term chat each Start Pet (Home button, shortcut, tile).
-            conversationManager.clearConversation()
-            Log.d(TAG, "Short-term memory cleared for new pet session")
         }
+        // Do not clear mid-session chat on every non-trigger start (e.g. Start Pet while
+        // overlay is already running). Fresh session is opened in onCreate.
         return START_STICKY
     }
 
@@ -116,15 +126,7 @@ class PetOverlayService : Service() {
         val factory = object : ViewModelProvider.Factory {
             @Suppress("UNCHECKED_CAST")
             override fun <T : androidx.lifecycle.ViewModel> create(modelClass: Class<T>): T =
-                PetViewModel(
-                    applicationContext,
-                    conversationManager,
-                    audioPipeline,
-                    preferenceManager,
-                    modelManager,
-                    animationController,
-                    uiFeedback,
-                ) as T
+                PetViewModel(petBrain) as T
         }
         return ViewModelProvider(lifecycleOwner, factory)[PetViewModel::class.java]
     }

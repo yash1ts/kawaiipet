@@ -42,11 +42,12 @@ class MemoryPipeline @Inject constructor(
      * Runs embedding/search on IO.
      */
     suspend fun retrieveForChat(userText: String): String = withContext(Dispatchers.IO) {
-        writeMutex.withLock { migrateLegacyLocked() }
+        // Gate first — don't take writeMutex / migrate on greetings (chat critical path).
         if (!retrievalGate.shouldRetrieve(userText)) {
             Log.d(TAG, "LTM retrieve skipped by gate")
             return@withContext ""
         }
+        // Legacy migration runs via scheduleFlushSession / index — not on chat critical path.
         if (!ragMemoryStore.ensureReady()) {
             Log.d(TAG, "LTM retrieve skipped (store not ready)")
             return@withContext ""
@@ -58,16 +59,23 @@ class MemoryPipeline @Inject constructor(
         }
         // Rewrite first-person user lines into third-person friend facts so the tiny
         // model does not adopt them ("I like cookie" → "I'm not a smart cookie").
-        val joined = chunks.joinToString(separator = "; ") { friendFactForPrompt(it) }
+        val facts = chunks.mapNotNull { friendFactForPrompt(it) }
+        if (facts.isEmpty()) {
+            Log.d(TAG, "LTM retrieve had chunks but none usable as facts")
+            return@withContext ""
+        }
+        val joined = facts.joinToString(separator = "; ")
         val clamped = LlmPromptDefaults.clampRetrievedMemory(joined)
-        Log.d(TAG, "LTM retrieve ok chunks=${chunks.size} len=${clamped.length}")
+        Log.d(TAG, "LTM retrieve ok facts=${facts.size}/${chunks.size} len=${clamped.length}")
         clamped
     }
 
-    /** Prompt-only rewrite; storage keeps the original user utterance. */
-    private fun friendFactForPrompt(raw: String): String {
+    /** Prompt-only rewrite; storage keeps the original user utterance. Null = skip. */
+    private fun friendFactForPrompt(raw: String): String? {
         val t = raw.trim().trimEnd('.', '!', '?')
-        if (t.isEmpty()) return t
+        if (t.isEmpty()) return null
+        // Never inject questions / capability lines as "memory".
+        if (!LlmPromptDefaults.looksLikeMemorableUserTurn(t)) return null
         val lower = t.lowercase()
         return when {
             lower.startsWith("i like ") -> "friend likes ${t.drop(7).trim()}"
@@ -75,11 +83,16 @@ class MemoryPipeline @Inject constructor(
             lower.startsWith("i hate ") -> "friend dislikes ${t.drop(7).trim()}"
             lower.startsWith("i prefer ") -> "friend prefers ${t.drop(9).trim()}"
             lower.startsWith("my name is ") -> "friend's name is ${t.drop(11).trim()}"
-            lower.startsWith("i'm ") -> "friend is ${t.drop(4).trim()}"
-            lower.startsWith("i am ") -> "friend is ${t.drop(5).trim()}"
+            lower.startsWith("i'm a ") || lower.startsWith("i am a ") ||
+                lower.startsWith("i'm an ") || lower.startsWith("i am an ") ->
+                "friend is ${t.lowercase().removePrefix("i'm ").removePrefix("i am ").trim()}"
             lower.startsWith("i live ") -> "friend lives ${t.drop(7).trim()}"
+            lower.startsWith("i work ") -> "friend works ${t.drop(7).trim()}"
+            lower.startsWith("i study ") -> "friend studies ${t.drop(8).trim()}"
+            lower.startsWith("i have ") -> "friend has ${t.drop(7).trim()}"
+            lower.startsWith("call me ") -> "friend's name is ${t.drop(8).trim()}"
             lower.startsWith("do you know ") -> friendFactForPrompt(t.drop(12).trim())
-            else -> "friend said: $t"
+            else -> "friend: $t"
         }
     }
 

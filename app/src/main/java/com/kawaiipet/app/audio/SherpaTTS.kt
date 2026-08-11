@@ -7,6 +7,7 @@ import com.k2fsa.sherpa.onnx.OfflineTtsConfig
 import com.k2fsa.sherpa.onnx.OfflineTtsKittenModelConfig
 import com.k2fsa.sherpa.onnx.OfflineTtsModelConfig
 import com.k2fsa.sherpa.onnx.OfflineTtsVitsModelConfig
+import com.kawaiipet.app.util.PreferenceManager
 
 /**
  * Offline TTS via Sherpa-ONNX [OfflineTts] (Kitten, or Piper VITS: model.onnx + tokens.txt + espeak-ng-data).
@@ -44,63 +45,77 @@ class SherpaTTS(private val modelManager: ModelManager) {
         }
 
         val kittenPaths = modelManager.resolveSherpaKittenTts(modelId)
-        val modelCfg = if (kittenPaths != null) {
-            val kittenCfg = OfflineTtsKittenModelConfig(
-                model = kittenPaths.modelPath,
-                voices = kittenPaths.voicesPath,
-                tokens = kittenPaths.tokensPath,
-                dataDir = kittenPaths.dataDirPath,
-                lengthScale = KITTEN_LENGTH_SCALE
-            )
-            OfflineTtsModelConfig().apply {
-                kitten = kittenCfg
-                numThreads = 2
-                debug = false
-                provider = "cpu"
-            }
-        } else {
-            val paths = modelManager.resolveSherpaVitsTts(modelId) ?: run {
+        val paths = if (kittenPaths == null) {
+            modelManager.resolveSherpaVitsTts(modelId) ?: run {
                 Log.e(TAG, "Not Kitten or VITS/Piper bundle: $modelId")
                 return false
             }
-            val vits = OfflineTtsVitsModelConfig(
-                model = paths.modelPath,
-                lexicon = paths.lexiconPath,
-                tokens = paths.tokensPath,
-                dataDir = paths.dataDirPath,
-                dictDir = paths.dictDirPath,
-                noiseScale = VITS_NOISE_SCALE,
-                noiseScaleW = VITS_NOISE_SCALE_W,
-                lengthScale = VITS_LENGTH_SCALE
+        } else {
+            null
+        }
+        val threads = SherpaOnnxRuntime.numThreads()
+        var lastError: Throwable? = null
+        for (provider in SherpaOnnxRuntime.preferredProviders()) {
+            val modelCfg = if (kittenPaths != null) {
+                val kittenCfg = OfflineTtsKittenModelConfig(
+                    model = kittenPaths.modelPath,
+                    voices = kittenPaths.voicesPath,
+                    tokens = kittenPaths.tokensPath,
+                    dataDir = kittenPaths.dataDirPath,
+                    lengthScale = KITTEN_LENGTH_SCALE
+                )
+                OfflineTtsModelConfig().apply {
+                    kitten = kittenCfg
+                    numThreads = threads
+                    debug = false
+                    this.provider = provider
+                }
+            } else {
+                val vitsPaths = paths!!
+                val vits = OfflineTtsVitsModelConfig(
+                    model = vitsPaths.modelPath,
+                    lexicon = vitsPaths.lexiconPath,
+                    tokens = vitsPaths.tokensPath,
+                    dataDir = vitsPaths.dataDirPath,
+                    dictDir = vitsPaths.dictDirPath,
+                    noiseScale = VITS_NOISE_SCALE,
+                    noiseScaleW = VITS_NOISE_SCALE_W,
+                    lengthScale = VITS_LENGTH_SCALE
+                )
+                OfflineTtsModelConfig().apply {
+                    this.vits = vits
+                    numThreads = threads
+                    debug = false
+                    this.provider = provider
+                }
+            }
+            val cfg = OfflineTtsConfig(
+                model = modelCfg,
+                ruleFsts = "",
+                ruleFars = "",
+                maxNumSentences = 1,
+                silenceScale = SILENCE_SCALE
             )
-            OfflineTtsModelConfig().apply {
-                this.vits = vits
-                numThreads = 2
-                debug = false
-                provider = "cpu"
+            try {
+                val engine = OfflineTts(assetManager = null, config = cfg)
+                tts = engine
+                initializedForModelId = modelId
+                sampleRate = engine.sampleRate()
+                Log.i(
+                    TAG,
+                    "TTS initialized: $modelId sampleRate=$sampleRate " +
+                        "provider=$provider threads=$threads",
+                )
+                return true
+            } catch (t: Throwable) {
+                lastError = t
+                Log.w(TAG, "TTS init failed provider=$provider — trying next", t)
             }
         }
-        val cfg = OfflineTtsConfig(
-            model = modelCfg,
-            ruleFsts = "",
-            ruleFars = "",
-            maxNumSentences = 1,
-            silenceScale = SILENCE_SCALE
-        )
-
-        return try {
-            val engine = OfflineTts(assetManager = null, config = cfg)
-            tts = engine
-            initializedForModelId = modelId
-            sampleRate = engine.sampleRate()
-            Log.i(TAG, "TTS initialized: $modelId sampleRate=$sampleRate")
-            true
-        } catch (t: Throwable) {
-            Log.e(TAG, "TTS init failed", t)
-            tts = null
-            initializedForModelId = null
-            false
-        }
+        Log.e(TAG, "TTS init failed for all providers", lastError)
+        tts = null
+        initializedForModelId = null
+        return false
     }
 
     fun generate(
@@ -110,14 +125,17 @@ class SherpaTTS(private val modelManager: ModelManager) {
     ): FloatArray? {
         val trimmed = text.trim()
         if (trimmed.isEmpty()) return null
-        val engine = synchronized(lock) { tts ?: return null }
-        return try {
-            val audio = engine.generate(trimmed, sid = speakerId, speed = speed)
-            sampleRate = audio.sampleRate
-            polishSamples(audio.samples.copyOf())
-        } catch (t: Throwable) {
-            Log.e(TAG, "TTS generate failed", t)
-            null
+        // Hold lock across native generate so release() cannot free the pointer mid-call.
+        return synchronized(lock) {
+            val engine = tts ?: return null
+            try {
+                val audio = engine.generate(trimmed, sid = speakerId, speed = speed)
+                sampleRate = audio.sampleRate
+                polishSamples(audio.samples.copyOf())
+            } catch (t: Throwable) {
+                Log.e(TAG, "TTS generate failed", t)
+                null
+            }
         }
     }
 
@@ -134,19 +152,21 @@ class SherpaTTS(private val modelManager: ModelManager) {
     ) {
         val trimmed = text.trim()
         if (trimmed.isEmpty()) return
-        val engine = synchronized(lock) { tts ?: return }
-
         for (sentence in splitIntoSentences(trimmed)) {
             if (sentence.isBlank()) continue
-            try {
-                val audio = engine.generate(sentence.trim(), sid = speakerId, speed = speed)
-                sampleRate = audio.sampleRate
-                val polished = polishSamples(audio.samples.copyOf())
-                if (polished.isNotEmpty()) {
-                    onChunk(polished)
+            val polished = synchronized(lock) {
+                val engine = tts ?: return
+                try {
+                    val audio = engine.generate(sentence.trim(), sid = speakerId, speed = speed)
+                    sampleRate = audio.sampleRate
+                    polishSamples(audio.samples.copyOf())
+                } catch (t: Throwable) {
+                    Log.e(TAG, "TTS generateChunked failed for chunk", t)
+                    null
                 }
-            } catch (t: Throwable) {
-                Log.e(TAG, "TTS generateChunked failed for chunk", t)
+            } ?: continue
+            if (polished.isNotEmpty()) {
+                onChunk(polished)
             }
         }
     }
@@ -204,7 +224,7 @@ class SherpaTTS(private val modelManager: ModelManager) {
         const val DEFAULT_SPEAKER_ID = 1
 
         /** Sherpa `generate` speed (paired with [AudioTrackManager] playback speed). */
-        const val DEFAULT_SYNTH_SPEED = 1.2f
+        const val DEFAULT_SYNTH_SPEED = PreferenceManager.TTS_SPEED_DEFAULT
 
         private const val KITTEN_LENGTH_SCALE = 1.0f
 
@@ -215,7 +235,7 @@ class SherpaTTS(private val modelManager: ModelManager) {
         private const val VITS_NOISE_SCALE_W = 0.65f
 
         /** Tighter pauses between sentences feel tidier. */
-        private const val SILENCE_SCALE = 0.11f
+        private const val SILENCE_SCALE = 0.08f
 
         private const val PCM_HEADROOM = 0.96f
         private const val SOFT_CLIP_START = 0.88f

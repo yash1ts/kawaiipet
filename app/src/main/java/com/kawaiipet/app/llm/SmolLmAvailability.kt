@@ -18,7 +18,7 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
 /**
- * Owns the on-device LiteRT-LM [Engine] backed by SmolLM2-135M.
+ * Owns the on-device LiteRT-LM [Engine] backed by SmolLM2-360M-Instruct.
  */
 @Singleton
 class SmolLmAvailability @Inject constructor(
@@ -44,17 +44,23 @@ class SmolLmAvailability @Inject constructor(
         engine?.let { return it }
         val path = modelFile().absolutePath
         if (!isModelOnDisk()) {
-            error("SmolLM model missing at $path")
+            error("SmolLM2 model missing at $path")
         }
         withContext(Dispatchers.Default) {
             Engine.setNativeMinLogSeverity(LogSeverity.ERROR)
-            val backends = listOf(Backend.GPU(), Backend.CPU())
+            // GPU first for throughput on Pixel; Tensor NPU next; CPU last resort.
+            val backends = listOf(
+                Backend.GPU(),
+                Backend.GOOGLE_TENSOR(),
+                Backend.CPU(),
+            )
             var lastError: Throwable? = null
             for (backend in backends) {
                 try {
                     val config = EngineConfig(
                         modelPath = path,
                         backend = backend,
+                        // Smaller KV = faster prefill/allocate for short pet turns.
                         maxNumTokens = MAX_NUM_TOKENS,
                         cacheDir = context.cacheDir.absolutePath,
                     )
@@ -76,7 +82,7 @@ class SmolLmAvailability @Inject constructor(
 
     suspend fun warmUp() {
         runCatching { ensureReady() }
-            .onFailure { Log.w(TAG, "SmolLM warmUp failed", it) }
+            .onFailure { Log.w(TAG, "SmolLM2 warmUp failed", it) }
     }
 
     fun close() {
@@ -87,7 +93,7 @@ class SmolLmAvailability @Inject constructor(
 
     companion object {
         private const val TAG = "SmolLmAvailability"
-        // Fits memory + short-term notes + system + reply.
+        // System + short-term window + reply. Model context is 4096; keep headroom.
         private const val MAX_NUM_TOKENS = 2048
     }
 }

@@ -11,6 +11,9 @@ object DefaultVoiceModels {
      */
     const val STT_MODEL_ID = "sherpa-onnx-moonshine-base-en-quantized-2026-02-27"
 
-    /** Sherpa-ONNX KittenTTS English nano v0.2. */
-    const val TTS_MODEL_ID = "kitten-nano-en-v0_2-fp16"
+    /**
+     * Sherpa-ONNX KittenTTS English nano 0.8 INT8 — same 0.8 family as PocketPal,
+     * leaner download than fp32; 8 speakers (sid 0–7).
+     */
+    const val TTS_MODEL_ID = "kitten-nano-en-v0_8-int8"
 }

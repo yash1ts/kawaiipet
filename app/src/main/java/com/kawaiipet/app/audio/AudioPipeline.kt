@@ -11,6 +11,11 @@ import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
 import android.util.Log
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.async
+import java.util.concurrent.atomic.AtomicInteger
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.channels.Channel
@@ -23,15 +28,12 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
-import kotlinx.coroutines.yield
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlin.coroutines.resume
 import kotlin.math.sqrt
 import com.kawaiipet.app.util.PreferenceManager
-
-enum class PipelineState { IDLE, LISTENING, PROCESSING, SPEAKING }
 
 class AudioPipeline(
     private val appContext: Context,
@@ -41,15 +43,16 @@ class AudioPipeline(
     private val player: AudioTrackManager,
     private val preferenceManager: PreferenceManager,
 ) {
-    private val _state = MutableStateFlow(PipelineState.IDLE)
-    val state: StateFlow<PipelineState> = _state.asStateFlow()
-
     private var recordJob: Job? = null
-    private val scope = CoroutineScope(Dispatchers.IO)
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val sttInputCleaner = SttInputCleaner()
+    private val speakMutex = Mutex()
+    private val speakGeneration = AtomicInteger(0)
 
     /** One-shot load of STT+TTS for the current pet session; see [schedulePetVoiceModelPrepare]. */
     private var petVoicePrepareJob: Job? = null
+    private val _enginesReady = MutableStateFlow(false)
+    val enginesReady: StateFlow<Boolean> = _enginesReady.asStateFlow()
 
     var onAmplitude: ((Float) -> Unit)?
         get() = player.onAmplitude
@@ -60,6 +63,19 @@ class AudioPipeline(
 
     fun initializeSTT(modelId: String): Boolean = stt.initialize(modelId)
     fun initializeTTS(modelId: String): Boolean = tts.initialize(modelId)
+
+    /**
+     * One discarded synth so Kitten's first real sentence isn't a cold kernel compile.
+     * Safe to call after [initializeTTS]; does not play audio.
+     */
+    suspend fun primeTts() {
+        if (!tts.isInitialized) return
+        val speakerId = preferenceManager.getTtsSpeakerId()
+        val samples = withContext(Dispatchers.Default) {
+            tts.generate("Hi.", speakerId = speakerId)
+        }
+        Log.d(TAG, "TTS primed samples=${samples?.size ?: 0}")
+    }
 
     /**
      * Starts loading the selected STT and TTS models once per overlay session.
@@ -74,13 +90,21 @@ class AudioPipeline(
     ) {
         if (petVoicePrepareJob?.isActive == true) return
         petVoicePrepareJob = scope.launch(Dispatchers.Default) {
-            if (loadStt && sttId.isNotBlank()) {
-                val ok = initializeSTT(sttId)
-                Log.d(TAG, "Pet voice prepare: STT id=$sttId success=$ok")
-            }
-            if (loadTts && ttsId.isNotBlank()) {
-                val ok = initializeTTS(ttsId)
-                Log.d(TAG, "Pet voice prepare: TTS id=$ttsId success=$ok")
+            try {
+                if (loadStt && sttId.isNotBlank()) {
+                    val ok = initializeSTT(sttId)
+                    Log.d(TAG, "Pet voice prepare: STT id=$sttId success=$ok")
+                }
+                if (loadTts && ttsId.isNotBlank()) {
+                    val ok = initializeTTS(ttsId)
+                    Log.d(TAG, "Pet voice prepare: TTS id=$ttsId success=$ok")
+                    if (ok) {
+                        runCatching { primeTts() }
+                            .onFailure { Log.d(TAG, "TTS prime during prepare failed", it) }
+                    }
+                }
+            } finally {
+                _enginesReady.value = stt.isInitialized || tts.isInitialized
             }
         }
     }
@@ -89,12 +113,24 @@ class AudioPipeline(
      * Waits for [schedulePetVoiceModelPrepare] to finish (up to [timeoutMs]), so engines are ready to reuse.
      */
     suspend fun awaitPetVoiceEnginesReady(timeoutMs: Long = 90_000L) {
-        withTimeoutOrNull(timeoutMs) {
-            while (petVoicePrepareJob == null) {
-                yield()
-            }
-            petVoicePrepareJob!!.join()
+        // Already ready (e.g. VoiceEngineWarmup finished) — do not spin.
+        if (stt.isInitialized && tts.isInitialized) {
+            _enginesReady.value = true
+            return
         }
+        withTimeoutOrNull(timeoutMs) {
+            val job = petVoicePrepareJob
+            if (job != null) {
+                job.join()
+            } else {
+                // Wait until prepare is scheduled or engines become ready.
+                while (petVoicePrepareJob == null && !stt.isInitialized) {
+                    delay(50)
+                }
+                petVoicePrepareJob?.join()
+            }
+        }
+        _enginesReady.value = stt.isInitialized || tts.isInitialized
     }
 
     /**
@@ -107,7 +143,6 @@ class AudioPipeline(
         timeoutMs: Long = DEFAULT_LISTEN_TIMEOUT_MS,
         onPartialText: (String) -> Unit = {}
     ): String {
-        _state.value = PipelineState.LISTENING
         Log.d(TAG, "listenAndTranscribe: starting, sttReady=${stt.isInitialized}")
 
         val awaitTimeoutMs = maxOf(timeoutMs, MAX_RECORDING_DURATION_MS + 3_000L)
@@ -125,7 +160,7 @@ class AudioPipeline(
             Log.e(TAG, "listenAndTranscribe failed", e)
             ""
         } finally {
-            _state.value = PipelineState.IDLE
+            // listening finished
         }
     }
 
@@ -239,13 +274,15 @@ class AudioPipeline(
                             return@readLoop
                         }
                     } else {
-                        stt.acceptWaveform(floatSamples)
+                        // Do not feed trailing silence into Moonshine — decode cost scales
+                        // with audio length. Buffer only to flush if speech resumes.
                         val endFloor = endOfSpeechFloor(noiseFloor, speechPeak, speechLevel)
                         if (energy <= endFloor && speechChunksTotal >= MIN_SPEECH_CHUNKS_BEFORE_END) {
                             silenceCount++
                         } else {
-                            // Background noise blip — don't accumulate forever, ease off slowly.
+                            // Noise blip / soft speech: flush pending silence then continue.
                             if (silenceCount > 0) silenceCount--
+                            stt.acceptWaveform(floatSamples)
                         }
                     }
                 }
@@ -277,9 +314,13 @@ class AudioPipeline(
         }
 
         val awaited = withTimeoutOrNull(timeoutMs) { result.await() }
+        // Decode in parallel with releasing the mic / AEC effects.
+        val textDeferred = scope.async(Dispatchers.Default) {
+            awaited ?: finalizeSherpaTranscript()
+        }
         recorder.stop()
         recordJob?.cancelAndJoin()
-        val text = awaited ?: finalizeSherpaTranscript()
+        val text = textDeferred.await()
 
         stt.endStream()
         return text.trim()
@@ -485,55 +526,71 @@ class AudioPipeline(
      * Streams TTS: synthesizes each sentence as it arrives on [sentences] and plays
      * audio as soon as the first chunk is ready (Sherpa KittenTTS / VITS).
      */
-    suspend fun speakSentences(sentences: ReceiveChannel<String>) {
-        if (!tts.isInitialized) {
-            awaitPetVoiceEnginesReady(timeoutMs = 90_000L)
-        }
-        if (!tts.isInitialized) {
-            Log.e(TAG, "Sherpa TTS not ready — skipping speak (no system fallback)")
-            for (ignored in sentences) { /* drain */ }
-            return
-        }
-
-        val speakerId = preferenceManager.getTtsSpeakerId()
-        _state.value = PipelineState.SPEAKING
-        player.outputVolume = preferenceManager.getTtsVolume()
-        try {
-            coroutineScope {
-                val pcm = Channel<FloatArray>(capacity = 4)
-                val playbackJob = launch(Dispatchers.IO) {
-                    player.playStreaming(pcm, tts.sampleRate)
-                }
-                val producer = launch(Dispatchers.Default) {
-                    try {
-                        var index = 0
-                        val t0 = SystemClock.elapsedRealtime()
-                        for (sentence in sentences) {
-                            val piece = sentence.trim()
-                            if (piece.isEmpty()) continue
-                            val samples = tts.generate(piece, speakerId = speakerId) ?: continue
-                            if (samples.isEmpty()) continue
-                            if (index == 0) {
-                                Log.i(
-                                    TAG,
-                                    "Sherpa TTS first audio chunk after " +
-                                        "${SystemClock.elapsedRealtime() - t0}ms " +
-                                        "(streaming with LLM)",
-                                )
-                            }
-                            index++
-                            pcm.send(samples)
-                        }
-                        Log.i(TAG, "Sherpa TTS spoke $index sentence(s)")
-                    } finally {
-                        pcm.close()
-                    }
-                }
-                producer.join()
-                playbackJob.join()
+    suspend fun speakSentences(
+        sentences: ReceiveChannel<String>,
+        speakerId: Int? = null,
+        volume: Float? = null,
+        speed: Float? = null,
+    ) {
+        speakMutex.withLock {
+            val gen = speakGeneration.incrementAndGet()
+            if (!tts.isInitialized) {
+                awaitPetVoiceEnginesReady(timeoutMs = 90_000L)
             }
-        } finally {
-            _state.value = PipelineState.IDLE
+            if (!tts.isInitialized) {
+                Log.e(TAG, "Sherpa TTS not ready — skipping speak (no system fallback)")
+                for (ignored in sentences) { /* drain */ }
+                return@withLock
+            }
+
+            val resolvedSpeaker = speakerId ?: preferenceManager.getTtsSpeakerId()
+            val resolvedVolume = volume ?: preferenceManager.getTtsVolume()
+            val resolvedSpeed = speed ?: preferenceManager.getTtsSpeed()
+            player.outputVolume = resolvedVolume
+            player.playbackSpeed = resolvedSpeed
+            try {
+                coroutineScope {
+                    val pcm = Channel<FloatArray>(capacity = 4)
+                    val playbackJob = launch(Dispatchers.IO) {
+                        if (speakGeneration.get() != gen) return@launch
+                        player.playStreaming(pcm, tts.sampleRate)
+                    }
+                    val producer = launch(Dispatchers.Default) {
+                        try {
+                            var index = 0
+                            val t0 = SystemClock.elapsedRealtime()
+                            for (sentence in sentences) {
+                                if (speakGeneration.get() != gen) break
+                                val piece = sentence.trim()
+                                if (piece.isEmpty()) continue
+                                val samples = tts.generate(
+                                    piece,
+                                    speakerId = resolvedSpeaker,
+                                    speed = resolvedSpeed,
+                                ) ?: continue
+                                if (samples.isEmpty()) continue
+                                if (index == 0) {
+                                    Log.i(
+                                        TAG,
+                                        "Sherpa TTS first audio chunk after " +
+                                            "${SystemClock.elapsedRealtime() - t0}ms " +
+                                            "(streaming with LLM)",
+                                    )
+                                }
+                                index++
+                                pcm.send(samples)
+                            }
+                            Log.i(TAG, "Sherpa TTS spoke $index sentence(s)")
+                        } finally {
+                            pcm.close()
+                        }
+                    }
+                    producer.join()
+                    playbackJob.join()
+                }
+            } finally {
+                // speak finished
+            }
         }
     }
 
@@ -541,7 +598,12 @@ class AudioPipeline(
      * One-shot speak of a full string (splits into sentences internally).
      * Sherpa KittenTTS only — no system TTS fallback.
      */
-    suspend fun speak(text: String) {
+    suspend fun speak(
+        text: String,
+        speakerId: Int? = null,
+        volume: Float? = null,
+        speed: Float? = null,
+    ) {
         if (text.isBlank()) {
             Log.w(TAG, "speak skipped: blank text")
             return
@@ -557,7 +619,7 @@ class AudioPipeline(
                     channel.close()
                 }
             }
-            speakSentences(channel)
+            speakSentences(channel, speakerId = speakerId, volume = volume, speed = speed)
         }
     }
 
@@ -565,22 +627,22 @@ class AudioPipeline(
         recorder.stop()
         recordJob?.cancel()
         stt.endStream()
-        _state.value = PipelineState.IDLE
     }
 
     fun stopSpeaking() {
+        speakGeneration.incrementAndGet()
         player.stop()
-        _state.value = PipelineState.IDLE
     }
 
     fun release() {
+        speakGeneration.incrementAndGet()
         petVoicePrepareJob?.cancel()
         petVoicePrepareJob = null
         recorder.release()
         player.release()
         stt.release()
         tts.release()
-        _state.value = PipelineState.IDLE
+        _enginesReady.value = false
     }
 
     companion object {
@@ -639,8 +701,8 @@ class AudioPipeline(
         /** Don't cut off until we've heard ~400ms of voiced audio. */
         private const val MIN_SPEECH_CHUNKS_BEFORE_END = 4
 
-        /** ~100ms per chunk — 16 ≈ 1.6s trailing silence (was 1.0s; clipped mid-thought). */
-        private const val SILENCE_CHUNKS_AFTER_SPEECH = 16
+        /** ~100ms per chunk — 9 ≈ 0.9s trailing silence (was 1.6s). */
+        private const val SILENCE_CHUNKS_AFTER_SPEECH = 9
 
         /** Keep ~300ms before VAD speech-start so first phonemes aren't clipped for offline ASR. */
         private const val PRE_SPEECH_LOOKBACK_CHUNKS = 3

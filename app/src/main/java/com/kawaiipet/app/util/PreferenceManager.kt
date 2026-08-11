@@ -6,6 +6,7 @@ import com.kawaiipet.app.llm.LlmPromptDefaults
 import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.floatPreferencesKey
 import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
@@ -23,8 +24,7 @@ class PreferenceManager(private val context: Context) {
         migrateSttModelId(it[Keys.STT_MODEL_ID] ?: DefaultVoiceModels.STT_MODEL_ID)
     }
     val ttsModelId: Flow<String> = context.dataStore.data.map {
-        val id = it[Keys.TTS_MODEL_ID] ?: DefaultVoiceModels.TTS_MODEL_ID
-        if (id == LEGACY_TTS_MODEL_ID) DefaultVoiceModels.TTS_MODEL_ID else id
+        migrateTtsModelId(it[Keys.TTS_MODEL_ID] ?: DefaultVoiceModels.TTS_MODEL_ID)
     }
     val personalityPrompt: Flow<String> = context.dataStore.data.map {
         it[Keys.PERSONALITY] ?: DEFAULT_PERSONALITY
@@ -33,7 +33,10 @@ class PreferenceManager(private val context: Context) {
         it[Keys.TTS_SPEAKER_ID] ?: 1
     }
     val ttsVolume: Flow<Float> = context.dataStore.data.map {
-        it[Keys.TTS_VOLUME] ?: 1f
+        (it[Keys.TTS_VOLUME] ?: TTS_VOLUME_DEFAULT).coerceIn(TTS_VOLUME_MIN, TTS_VOLUME_MAX)
+    }
+    val ttsSpeed: Flow<Float> = context.dataStore.data.map {
+        (it[Keys.TTS_SPEED] ?: TTS_SPEED_DEFAULT).coerceIn(TTS_SPEED_MIN, TTS_SPEED_MAX)
     }
     /**
      * Legacy long-term memory paragraph (pre-RAG). Kept for one-shot migration into the
@@ -53,14 +56,13 @@ class PreferenceManager(private val context: Context) {
         return migrateSttModelId(id)
     }
 
-    suspend fun getTtsModelId(): String {
-        val id = ttsModelId.first()
-        return if (id == LEGACY_TTS_MODEL_ID) DefaultVoiceModels.TTS_MODEL_ID else id
-    }
+    suspend fun getTtsModelId(): String = ttsModelId.first()
 
     suspend fun getTtsSpeakerId(): Int = ttsSpeakerId.first()
 
     suspend fun getTtsVolume(): Float = ttsVolume.first()
+
+    suspend fun getTtsSpeed(): Float = ttsSpeed.first()
 
     suspend fun getMemoryParagraph(): String =
         LlmPromptDefaults.clampMemoryParagraph(memoryParagraph.first())
@@ -117,8 +119,32 @@ class PreferenceManager(private val context: Context) {
     }
 
     suspend fun setTtsVolume(value: Float) {
-        context.dataStore.edit { it[Keys.TTS_VOLUME] = value.coerceIn(0f, 1f) }
+        context.dataStore.edit {
+            it[Keys.TTS_VOLUME] = value.coerceIn(TTS_VOLUME_MIN, TTS_VOLUME_MAX)
+            it[Keys.TTS_VOLUME_VERSION] = TTS_VOLUME_PREF_VERSION
+        }
     }
+
+    suspend fun setTtsSpeed(value: Float) {
+        context.dataStore.edit {
+            it[Keys.TTS_SPEED] = value.coerceIn(TTS_SPEED_MIN, TTS_SPEED_MAX)
+        }
+    }
+
+    /** Cap volume at 100% and reset boosted defaults from older builds. */
+    suspend fun migrateTtsVolumeDefaultIfNeeded() {
+        context.dataStore.edit { prefs ->
+            val version = prefs[Keys.TTS_VOLUME_VERSION] ?: 0
+            if (version >= TTS_VOLUME_PREF_VERSION) return@edit
+            val current = prefs[Keys.TTS_VOLUME]
+            prefs[Keys.TTS_VOLUME] = when {
+                current == null || current > TTS_VOLUME_MAX -> TTS_VOLUME_DEFAULT
+                else -> current.coerceIn(TTS_VOLUME_MIN, TTS_VOLUME_MAX)
+            }
+            prefs[Keys.TTS_VOLUME_VERSION] = TTS_VOLUME_PREF_VERSION
+        }
+    }
+
 
     private object Keys {
         val PET_NAME = stringPreferencesKey("pet_name")
@@ -128,12 +154,30 @@ class PreferenceManager(private val context: Context) {
         val PERSONALITY_VERSION = intPreferencesKey("personality_version")
         val TTS_SPEAKER_ID = intPreferencesKey("tts_speaker_id")
         val TTS_VOLUME = floatPreferencesKey("tts_volume")
+        val TTS_VOLUME_VERSION = intPreferencesKey("tts_volume_version")
+        val TTS_SPEED = floatPreferencesKey("tts_speed")
         val MEMORY_PARAGRAPH = stringPreferencesKey("memory_paragraph")
     }
 
     companion object {
         val DEFAULT_PERSONALITY: String = LlmPromptDefaults.DEFAULT_PERSONALITY
-        private const val LEGACY_TTS_MODEL_ID = "piper-en_US-amy-medium"
+
+        /** Soft gain applied to TTS PCM (1.0 = full / max). */
+        const val TTS_VOLUME_MIN = 0.2f
+        const val TTS_VOLUME_MAX = 1.0f
+        const val TTS_VOLUME_DEFAULT = 1.0f
+        private const val TTS_VOLUME_PREF_VERSION = 2
+
+        /** Pet voice rate for Sherpa synth + AudioTrack playback (both use this). */
+        const val TTS_SPEED_MIN = 0.8f
+        const val TTS_SPEED_MAX = 1.5f
+        const val TTS_SPEED_DEFAULT = 1.1f
+
+        private val LEGACY_TTS_MODEL_IDS = setOf(
+            "piper-en_US-amy-medium",
+            "kitten-nano-en-v0_1-fp16",
+            "kitten-nano-en-v0_2-fp16",
+        )
 
         private val LEGACY_STT_MODEL_IDS = setOf(
             "moonshine-tiny-en-quantized",
@@ -144,5 +188,8 @@ class PreferenceManager(private val context: Context) {
 
         private fun migrateSttModelId(id: String): String =
             if (id in LEGACY_STT_MODEL_IDS) DefaultVoiceModels.STT_MODEL_ID else id
+
+        private fun migrateTtsModelId(id: String): String =
+            if (id in LEGACY_TTS_MODEL_IDS) DefaultVoiceModels.TTS_MODEL_ID else id
     }
 }
