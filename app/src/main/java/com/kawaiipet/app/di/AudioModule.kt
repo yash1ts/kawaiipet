@@ -7,6 +7,7 @@ import com.kawaiipet.app.audio.AudioTrackManager
 import com.kawaiipet.app.audio.ModelManager
 import com.kawaiipet.app.audio.SherpaSTT
 import com.kawaiipet.app.audio.SherpaTTS
+import com.kawaiipet.app.audio.SherpaVad
 import com.kawaiipet.app.util.PreferenceManager
 import dagger.Module
 import dagger.Provides
@@ -46,12 +47,18 @@ object AudioModule {
 
     @Provides
     @Singleton
+    fun provideSherpaVad(modelManager: ModelManager): SherpaVad =
+        SherpaVad(modelManager)
+
+    @Provides
+    @Singleton
     fun provideAudioPipeline(
         @ApplicationContext context: Context,
         stt: SherpaSTT,
         tts: SherpaTTS,
+        vad: SherpaVad,
         recorder: AudioRecordManager,
         player: AudioTrackManager,
         preferenceManager: PreferenceManager,
-    ): AudioPipeline = AudioPipeline(context, stt, tts, recorder, player, preferenceManager)
+    ): AudioPipeline = AudioPipeline(context, stt, tts, vad, recorder, player, preferenceManager)
 }

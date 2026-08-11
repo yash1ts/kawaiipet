@@ -6,6 +6,9 @@ import com.k2fsa.sherpa.onnx.FeatureConfig
 
 /**
  * Central STT tuning: capture rate, feature extraction, and streaming endpoint rules.
+ *
+ * Moonshine (offline) has no built-in VAD knobs in sherpa-onnx — speech bounds come from
+ * [SherpaVad] (Silero); capture noise reduction from [AudioRecordManager] NS/AEC.
  */
 object SttEngineConfig {
     const val SAMPLE_RATE = 16_000
@@ -13,8 +16,9 @@ object SttEngineConfig {
 
     /**
      * Tiny dither stabilizes mel / log computations on quiet speech without adding audible noise.
+     * Slightly higher than stock helps very quiet talkers after aggressive NS.
      */
-    const val FEATURE_DITHER = 1.0e-5f
+    const val FEATURE_DITHER = 2.0e-5f
 
     /**
      * Offline transducer blank penalty (no-op for Moonshine / NeMo CTC in sherpa-onnx).
@@ -26,8 +30,7 @@ object SttEngineConfig {
         FeatureConfig(SAMPLE_RATE, FEATURE_DIM, FEATURE_DITHER)
 
     /**
-     * Endpoint rules for Zipformer streaming: more patient trailing silence so pauses
-     * mid-sentence aren't cut as aggressively.
+     * Endpoint rules for Zipformer streaming only (unused by Moonshine offline).
      */
     fun endpointConfig(): EndpointConfig = EndpointConfig(
         EndpointRule(true, minTrailingSilence = 2.8f, minUtteranceLength = 0f),

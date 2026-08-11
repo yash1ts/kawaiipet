@@ -11,5 +11,6 @@ sealed class PetTurnState {
     data object Transcribing : PetTurnState()
     data class Thinking(val userText: String) : PetTurnState()
     data class Speaking(val text: String) : PetTurnState()
-    data class Settling(val expression: PetExpression) : PetTurnState()
+    /** Keep [text] so the bubble does not flash empty after TTS. */
+    data class Settling(val expression: PetExpression, val text: String) : PetTurnState()
 }

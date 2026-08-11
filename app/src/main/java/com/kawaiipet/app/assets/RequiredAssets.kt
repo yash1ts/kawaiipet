@@ -7,9 +7,12 @@ import com.kawaiipet.app.audio.DefaultVoiceModels
  */
 object RequiredAssets {
 
-    /** SmolLM2-360M Instruct (~374 MiB) via LiteRT-LM — no thinking/CoT mode. */
-    const val LLM_MODEL_ID = "smollm2-360m"
-    const val LLM_FILE_NAME = "SmolLM2_360M_instruct.litertlm"
+    /**
+     * Qwen3-0.6B INT4 no-think via LiteRT-LM (~347 MB).
+     * Prefills empty `<think></think>` so replies are direct (no CoT to strip); ekv1280.
+     */
+    const val LLM_MODEL_ID = "qwen3-0.6b-nothink"
+    const val LLM_FILE_NAME = "qwen3_0.6b_nothink_q4_block32_ekv1280.litertlm"
 
     const val EMBEDDER_MODEL_ID = "all-minilm-l6-v2"
     const val EMBEDDER_ONNX_FILE = "model.onnx"
@@ -18,14 +21,14 @@ object RequiredAssets {
     private const val MINILM_BASE =
         "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main"
 
-    private const val SMOLLM2_LITERT_BASE =
-        "https://huggingface.co/litert-community/SmolLM2-360M-Instruct/resolve/main"
+    private const val QWEN3_LITERT_BASE =
+        "https://huggingface.co/litert-community/Qwen3-0.6B-int4/resolve/main"
 
     val ALL: List<AssetSpec> = listOf(
         AssetSpec(
             id = LLM_MODEL_ID,
             displayName = "Pet brain",
-            url = "$SMOLLM2_LITERT_BASE/$LLM_FILE_NAME",
+            url = "$QWEN3_LITERT_BASE/$LLM_FILE_NAME",
             kind = AssetKind.RawFile(fileName = LLM_FILE_NAME),
         ),
         AssetSpec(
@@ -51,6 +54,13 @@ object RequiredAssets {
             url = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/" +
                 "${DefaultVoiceModels.STT_MODEL_ID}.tar.bz2",
             kind = AssetKind.TarBz2,
+        ),
+        AssetSpec(
+            id = DefaultVoiceModels.VAD_MODEL_ID,
+            displayName = "Voice detection",
+            url = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/" +
+                DefaultVoiceModels.VAD_FILE_NAME,
+            kind = AssetKind.RawFile(fileName = DefaultVoiceModels.VAD_FILE_NAME),
         ),
         AssetSpec(
             id = DefaultVoiceModels.TTS_MODEL_ID,

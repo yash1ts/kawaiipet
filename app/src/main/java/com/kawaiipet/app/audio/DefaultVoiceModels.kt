@@ -16,4 +16,8 @@ object DefaultVoiceModels {
      * leaner download than fp32; 8 speakers (sid 0–7).
      */
     const val TTS_MODEL_ID = "kitten-nano-en-v0_8-int8"
+
+    /** Silero neural VAD (~2 MB) — used for speech start/end before Moonshine decode. */
+    const val VAD_MODEL_ID = "silero-vad"
+    const val VAD_FILE_NAME = "silero_vad.onnx"
 }

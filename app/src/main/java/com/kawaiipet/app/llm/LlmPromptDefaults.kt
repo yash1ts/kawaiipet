@@ -1,7 +1,7 @@
 package com.kawaiipet.app.llm
 
 /**
- * Prompt + sampler defaults for on-device SmolLM2-360M via LiteRT-LM.
+ * Prompt + sampler defaults for on-device Qwen3-0.6B (no-think INT4) via LiteRT-LM.
  *
  * Long-term memory is RAG-retrieved chunks (prompt-sized); short-term is recent messages.
  */
@@ -15,7 +15,7 @@ object LlmPromptDefaults {
 
     /**
      * Shipped Mochi personality — a pet friend you hang out with, not a helper bot.
-     * Keep short: SmolLM2-360M follows brief role cues best.
+     * Keep short: Qwen3-0.6B follows brief role cues best for spoken pet turns.
      */
     const val DEFAULT_PERSONALITY =
         "Cozy playful virtual pet friend. Chat about daily life, feelings, and little moments. "
@@ -51,7 +51,7 @@ object LlmPromptDefaults {
     const val CLARIFY_FALLBACK = "Remind you of what? I'm right here."
 
     /**
-     * Sampler defaults for SmolLM2-360M-Instruct — balanced friend chat
+     * Sampler defaults for Qwen3-0.6B no-think — balanced friend chat
      * (not as tight as 0.5/48, not as loose as 0.75/96).
      */
     const val SAMPLER_TOP_K = 30
@@ -83,103 +83,52 @@ object LlmPromptDefaults {
     const val NO_REPEAT_NGRAM_WINDOW = 0
 
     /**
-     * Stable system prompt for SmolLM2-360M — short role + friend chat style.
+     * Stable system prompt for Qwen3-0.6B — short role + friend chat style.
+     * App open/play intents are handled by keyword NLU, not this prompt.
      */
     fun buildSystemPrompt(
         petName: String,
         personality: String,
         @Suppress("UNUSED_PARAMETER") memoryParagraph: String = "",
+        @Suppress("UNUSED_PARAMETER") openAppIds: String = "",
     ): String {
         val name = petName.trim().ifEmpty { "Mochi" }
         // Keep the system preface short — prefill cost scales with this.
         val vibe = personality.trim().ifEmpty { DEFAULT_PERSONALITY }.take(120)
         return buildString {
             append("You are $name, their tiny pet friend. $vibe\n")
-            append("Answer what they just said as a close buddy. And sometimes ask questions about their life.")
+            append("Answer what they just said as a close buddy. And sometimes ask questions about their life. ")
             append("1–2 short spoken sentences. No apologies about the chat. Don't echo them. ")
-            append("Plain speech only. End with [happy], [sad], [angry], or [thinking].")
+            append("You can suggest music, movies, books etc if asked.")
+            append("Plain speech only. ")
+            append("Finish with one emotion tag: [happy], [sad], [angry], or [thinking].")
         }
+    }
+
+    /** True when the user is asking to open/play/launch something (keyword intent path). */
+    fun looksLikeActionIntent(userText: String): Boolean {
+        val n = userText.lowercase()
+        if (!Regex("\\b(open|launch|start|play|pull up|bring up|go to|fire up)\\b").containsMatchIn(n)) {
+            return false
+        }
+        // Play alone counts (song requests). Open/launch need an app-ish cue or stay broad.
+        if (Regex("\\bplay\\b").containsMatchIn(n)) return true
+        return Regex(
+            "youtube|spotify|chrome|browser|maps|camera|photos|gmail|settings|wifi|" +
+                "bluetooth|clock|calculator|calendar|messages|phone|playstore|play store|app",
+        ).containsMatchIn(n)
     }
 
     /** Prefix retrieved facts onto the user turn without changing the system prompt. */
     fun attachMemoryToUserTurn(userText: String, memoryParagraph: String): String {
         val memory = clampRetrievedMemory(memoryParagraph)
         if (memory.isBlank()) return userText
-        // Keep the user line first so the tiny model answers it, not the notes.
+        // Keep the user line first so the model answers it, not the notes.
         return buildString {
             append(userText)
             append("\nNotes: ")
             append(memory)
         }
-    }
-
-    /**
-     * True when a reply would poison sticky history (phrase loops / meta apology spam).
-     * Used for history hygiene only — not for mid-stream TTS abort.
-     */
-    fun isDegenerateReply(text: String): Boolean {
-        val t = text.trim()
-        if (t.isEmpty()) return true
-        if (isCannedFallback(t)) return false
-        val lower = t.lowercase()
-        val sorryCount = Regex("\\bsorry\\b").findAll(lower).count()
-        if (sorryCount >= 2) return true
-        if (lower.contains("last few sentences") ||
-            lower.contains("please don't be so sorry") ||
-            lower.contains("bit of a companion") ||
-            lower.contains("living companion") ||
-            lower.contains("my instructions")
-        ) {
-            return true
-        }
-        val collapsed = collapseRepeatedPhrases(t)
-        if (t.length >= 40 && collapsed.length < t.length * 0.55f) return true
-        return false
-    }
-
-    /** True when the user is greeting / asking how the pet is (fallback routing). */
-    fun userInvitesGreeting(userText: String): Boolean {
-        val n = normalizeEchoKey(userText)
-        if (n.isEmpty()) return false
-        if (n == "hi" || n == "hello" || n == "hey" || n == "yo" || n == "hiya") return true
-        if (n.startsWith("hi ") || n.startsWith("hello ") || n.startsWith("hey ")) {
-            if (n.split(' ').size <= 4) return true
-        }
-        return n.contains("how are you") ||
-            n.contains("how you doing") ||
-            n.contains("hows it going") ||
-            n.contains("how is it going") ||
-            n.contains("whats up") ||
-            n.contains("what s up")
-    }
-
-    private fun normalizeEchoKey(text: String): String =
-        text.lowercase()
-            .replace(Regex("^(user|assistant|pet)\\s*:\\s*"), "")
-            .replace(Regex("[^a-z0-9\\s]"), " ")
-            .replace(Regex("\\s+"), " ")
-            .trim()
-
-    /**
-     * True when the spoken answer looks cut off mid-phrase (token budget exhausted).
-     */
-    fun isTruncatedMidPhrase(text: String): Boolean {
-        val t = text.trim()
-        if (t.isEmpty()) return true
-        val last = t.last()
-        if (last == '.' || last == '!' || last == '?' || last == '"' || last == '”') return false
-        // Ends with a contracted / dangling token — classic truncate.
-        val lower = t.lowercase()
-        if (lower.endsWith(" it's") || lower.endsWith(" i'm") || lower.endsWith(" i've") ||
-            lower.endsWith(" don't") || lower.endsWith(" can't") || lower.endsWith(" a") ||
-            lower.endsWith(" the") || lower.endsWith(" to") || lower.endsWith(" and") ||
-            lower.endsWith(" little") || lower.endsWith(" more")
-        ) {
-            return true
-        }
-        // Short answer with no terminal punct.
-        if (t.length < 28 && !t.any { it == '.' || it == '!' || it == '?' }) return true
-        return false
     }
 
     /**
@@ -214,7 +163,7 @@ object LlmPromptDefaults {
      */
     fun stripSpeechFormatting(text: String): String {
         if (text.isEmpty()) return text
-        var t = text
+        var t = stripThinkBlocks(text)
         // Fenced / inline code → inner text
         t = Regex("```[\\s\\S]*?```").replace(t, " ")
         t = Regex("`([^`]+)`").replace(t, "$1")
@@ -226,6 +175,16 @@ object LlmPromptDefaults {
         // Headings / bullets
         t = Regex("(?m)^\\s{0,3}#{1,6}\\s+").replace(t, "")
         t = Regex("(?m)^\\s*[-*•]+\\s+").replace(t, "")
+        // Prompt-instruction leak the tiny model often copies into speech
+        t = Regex(
+            """(?i)\bend with\b[^.!?]*""",
+        ).replace(t, " ")
+        t = Regex(
+            """(?i)\bfinish with\b[^.!?]*""",
+        ).replace(t, " ")
+        t = Regex(
+            """(?i)\bthen one emotion tag\b[^.!?]*""",
+        ).replace(t, " ")
         // Any leftover decorative markers common in chat models
         t = t.replace("*", "")
             .replace("_", " ")
@@ -234,6 +193,27 @@ object LlmPromptDefaults {
             .replace("~", " ")
         t = stripEmojis(t)
         return normalizeSpeechWhitespace(t)
+    }
+
+    /**
+     * Qwen3 may still emit `<think>…</think>` (empty for nothink, or leftover CoT).
+     * Drop closed blocks; if a think block is still open mid-stream, hold the tail.
+     */
+    fun stripThinkBlocks(text: String): String {
+        if (text.isEmpty()) return text
+        if (!text.contains("<think", ignoreCase = true) &&
+            !text.contains("</think>", ignoreCase = true)
+        ) {
+            return text
+        }
+        var t = THINK_BLOCK_REGEX.replace(text, " ")
+        val open = t.indexOf("<think", ignoreCase = true)
+        if (open >= 0) {
+            // Incomplete stream — keep only text before the open tag.
+            t = t.substring(0, open)
+        }
+        t = t.replace("</think>", " ", ignoreCase = true)
+        return t
     }
 
     /** Formatting-strip for anything shown or spoken. */
@@ -604,6 +584,9 @@ object LlmPromptDefaults {
         "[happy]", "[sad]", "[angry]", "[thinking]", "[idle]",
         "[listening]", "[talking]", "[sleeping]",
     )
+
+    private val THINK_BLOCK_REGEX =
+        Regex("""(?is)<think\b[^>]*>.*?</think>""")
 
     private val LABEL_PREFIXES = listOf(
         "updated memory:", "recent conversation:", "short-term:", "short term:",

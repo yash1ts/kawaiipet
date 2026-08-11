@@ -21,9 +21,9 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
 /**
- * SmolLM2-360M via LiteRT-LM for multi-turn pet chat:
+ * Qwen3-0.6B INT4 (no-think) via LiteRT-LM for multi-turn pet chat:
  * - Sticky conversation + KV cache (multi-turn TTFT win)
- * - Non-thinking instruct model (no CoT / think tags)
+ * - No-think artifact (empty think block baked in — no CoT to strip)
  * - Streams sanitized tokens to UI/TTS as they arrive
  * - Per-turn repetition / n-gram penalties for short pet replies
  */
@@ -43,6 +43,9 @@ class SmolLmLlmService @Inject constructor(
     private var stickyTurnCount: Int = 0
     /** Rough token estimate for sticky contents (system + history + replies). */
     private var stickyTokenEstimate: Int = 0
+
+    /** History size baked into sticky at create time (0 = system-only warmup). */
+    private var stickyInitialHistoryCount: Int = 0
 
     override suspend fun warmUp() {
         smolLm.warmUp()
@@ -81,7 +84,7 @@ class SmolLmLlmService @Inject constructor(
 
         Log.d(
             TAG,
-            "chat model=SmolLM2-360M systemLen=${systemPrompt.length} " +
+            "chat model=Qwen3-0.6B-nothink systemLen=${systemPrompt.length} " +
                 "memoryLen=${memoryParagraph.length} prior=${prior.size} " +
                 "latestLen=${latestUser.length} " +
                 "promptUser=${promptUser.take(160).toOneLineLog()}",
@@ -172,24 +175,28 @@ class SmolLmLlmService @Inject constructor(
                 finalized = true,
             ).orEmpty().trim()
 
-            if (spokenFinal.isBlank()) {
-                keepSticky = false
+            val usable = when {
+                spokenFinal.isBlank() -> {
+                    keepSticky = false
+                    ""
+                }
+                else -> {
+                    Log.i(
+                        TAG,
+                        "llm done sticky=$keepSticky " +
+                            "contentLen=${contentFromMessage.length} rawLen=${rawAll.length} " +
+                            "spokenLen=${spokenFinal.length} " +
+                            "spoken=${spokenFinal.take(120).toOneLineLog()}",
+                    )
+                    logBenchmark(startedAt, spokenFinal.length, rawAll.length)
+                    if (keepSticky && stickyConversation === conversation) {
+                        stickyTurnCount += 1
+                        stickyTokenEstimate += estimateTokens(promptUser) + estimateTokens(spokenFinal)
+                    }
+                    spokenFinal
+                }
             }
-
-            Log.i(
-                TAG,
-                "llm done sticky=$keepSticky " +
-                    "contentLen=${contentFromMessage.length} rawLen=${rawAll.length} " +
-                    "spokenLen=${spokenFinal.length} " +
-                    "raw=${rawAll.take(220).toOneLineLog()} " +
-                    "spoken=${spokenFinal.take(120).toOneLineLog()}",
-            )
-            logBenchmark(startedAt, spokenFinal.length, rawAll.length)
-            if (keepSticky && stickyConversation === conversation) {
-                stickyTurnCount += 1
-                stickyTokenEstimate += estimateTokens(promptUser) + estimateTokens(spokenFinal)
-            }
-            spokenFinal
+            usable
         } catch (e: CancellationException) {
             keepSticky = false
             throw e
@@ -223,7 +230,9 @@ class SmolLmLlmService @Inject constructor(
             stickyConversation == null ||
             stickySystemPrompt != systemPrompt ||
             stickyTurnCount >= LlmPromptDefaults.MAX_SHORT_TERM_MESSAGES ||
-            stickyTokenEstimate >= budget
+            stickyTokenEstimate >= budget ||
+            // Warmup often prefills an empty sticky; rebuild once we have real history.
+            (priorMessages.isNotEmpty() && stickyInitialHistoryCount == 0 && stickyTurnCount == 0)
 
         stickyConversation?.let { existing ->
             if (!needsRebuild) {
@@ -244,6 +253,7 @@ class SmolLmLlmService @Inject constructor(
         stickyConversation = created
         stickySystemPrompt = systemPrompt
         stickyTurnCount = 0
+        stickyInitialHistoryCount = priorMessages.size
         stickyTokenEstimate = estimateTokens(systemPrompt) +
             priorMessages.sumOf { estimateTokens(it.text) }
         Log.i(
@@ -266,6 +276,7 @@ class SmolLmLlmService @Inject constructor(
         stickySystemPrompt = null
         stickyTurnCount = 0
         stickyTokenEstimate = 0
+        stickyInitialHistoryCount = 0
         runCatching { c.close() }
         Log.d(TAG, "Closed sticky ($reason)")
     }
@@ -285,6 +296,10 @@ class SmolLmLlmService @Inject constructor(
         engine: com.google.ai.edge.litertlm.Engine,
         systemPrompt: String,
         priorMessages: List<ChatMessage>,
+        maxOutputTokens: Int = LlmPromptDefaults.MAX_OUTPUT_TOKENS,
+        temperature: Double = LlmPromptDefaults.SAMPLER_TEMPERATURE,
+        topK: Int = LlmPromptDefaults.SAMPLER_TOP_K,
+        topP: Double = LlmPromptDefaults.SAMPLER_TOP_P,
     ): Conversation {
         val history = ArrayList<Message>(priorMessages.size)
         for (msg in priorMessages) {
@@ -298,22 +313,21 @@ class SmolLmLlmService @Inject constructor(
             }
         }
         val sampler = SamplerConfig(
-            topK = LlmPromptDefaults.SAMPLER_TOP_K,
-            topP = LlmPromptDefaults.SAMPLER_TOP_P,
-            temperature = LlmPromptDefaults.SAMPLER_TEMPERATURE,
+            topK = topK,
+            topP = topP,
+            temperature = temperature,
         )
-        val maxOut = LlmPromptDefaults.MAX_OUTPUT_TOKENS
         val config = ConversationConfig(
             systemInstruction = Contents.of(systemPrompt),
             initialMessages = history,
             samplerConfig = sampler,
             prefillPrefaceOnInit = true,
-            maxOutputToken = maxOut,
+            maxOutputToken = maxOutputTokens,
         )
         Log.i(
             TAG,
             "Created conversation history=${history.size} " +
-                "maxOut=$maxOut temp=${sampler.temperature} topP=${sampler.topP} topK=${sampler.topK}",
+                "maxOut=$maxOutputTokens temp=$temperature topP=$topP topK=$topK",
         )
         return engine.createConversation(config)
     }
@@ -336,8 +350,8 @@ class SmolLmLlmService @Inject constructor(
         val fromContents = message.contents.contents
             .mapNotNull { (it as? Content.Text)?.text }
             .joinToString("")
-        if (fromContents.isNotEmpty()) return fromContents
-        return message.toString()
+        // Never fall back to Message.toString() — it dumps binary / debug junk into TTS.
+        return fromContents
     }
 
     private fun mergeStreamText(previous: String, incoming: String): String {
@@ -370,8 +384,8 @@ class SmolLmLlmService @Inject constructor(
 
     companion object {
         private const val TAG = "SmolLmLlmService"
-        /** Must match [SmolLmAvailability] engine maxNumTokens. */
-        private const val KV_TOKEN_BUDGET = 2048
+        /** Must match [SmolLmAvailability] engine maxNumTokens (ekv1280). */
+        private const val KV_TOKEN_BUDGET = 1280
         /** Rebuild sticky before filling the KV budget. */
         private const val STICKY_BUDGET_FRACTION = 0.65f
     }

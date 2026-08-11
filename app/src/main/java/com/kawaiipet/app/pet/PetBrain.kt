@@ -8,6 +8,7 @@ import com.kawaiipet.app.audio.ModelManager
 import com.kawaiipet.app.llm.ConversationManager
 import com.kawaiipet.app.llm.LlmEngineWarmup
 import com.kawaiipet.app.llm.LlmPromptDefaults
+import com.kawaiipet.app.tools.AppLauncher
 import com.kawaiipet.app.util.Analytics
 import com.kawaiipet.app.util.DebugSessionLog
 import com.kawaiipet.app.util.PermissionHelper
@@ -47,6 +48,7 @@ class PetBrain @Inject constructor(
     private val modelManager: ModelManager,
     private val animationController: PetAnimationController,
     private val uiFeedback: UiFeedback,
+    private val appLauncher: AppLauncher,
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
 
@@ -225,6 +227,7 @@ class PetBrain @Inject constructor(
             coroutineScope {
                 val sentenceChannel = Channel<String>(capacity = 32)
                 val startedSpeaking = AtomicBoolean(false)
+                val queuedTts = AtomicBoolean(false)
                 val speakJob = async(Dispatchers.IO) {
                     val cfg = sessionConfigStore.snapshot()
                     audioPipeline.speakSentences(
@@ -235,13 +238,24 @@ class PetBrain @Inject constructor(
                     )
                 }
 
-                fun beginSpeakingUi() {
-                    if (!startedSpeaking.compareAndSet(false, true)) return
-                    val display = _currentResponse.value
-                    _state.value = PetTurnState.Speaking(display)
-                    animationController.setExpression(PetExpression.TALKING)
-                    uiFeedback.petSpeakingStart()
-                    startMouthAnimation()
+                /** Publish bubble text on Main before any TTS work. Never show empty Speaking. */
+                suspend fun publishReplyUi(raw: String, startTalking: Boolean) {
+                    val display = raw.trim()
+                    if (display.isEmpty()) return
+                    withContext(Dispatchers.Main.immediate) {
+                        _currentResponse.value = display
+                        if (startTalking) {
+                            if (startedSpeaking.compareAndSet(false, true)) {
+                                _state.value = PetTurnState.Speaking(display)
+                                animationController.setExpression(PetExpression.TALKING)
+                                uiFeedback.petSpeakingStart()
+                                startMouthAnimation()
+                            } else {
+                                _state.value = PetTurnState.Speaking(display)
+                            }
+                        }
+                        // Even while Thinking: bubbleVisible uses responseText on Processing.
+                    }
                 }
 
                 val genStarted = SystemClock.elapsedRealtime()
@@ -250,11 +264,10 @@ class PetBrain @Inject constructor(
                     conversationManager.processUserInput(
                         text = userText,
                         onPartial = { display ->
-                            // Stream bubble text as tokens arrive.
-                            _currentResponse.value = display
-                            if (display.length >= 2) {
-                                beginSpeakingUi()
-                                _state.value = PetTurnState.Speaking(display)
+                            val trimmed = display.trim()
+                            if (trimmed.isNotEmpty()) {
+                                // Stream into bubble during Thinking; flip to Talking once TTS starts.
+                                publishReplyUi(trimmed, startTalking = false)
                             }
                         },
                         onSpeakableSentence = speak@{ sentence ->
@@ -264,10 +277,11 @@ class PetBrain @Inject constructor(
                                 return@speak
                             }
                             lastTtsPiece = piece
-                            beginSpeakingUi()
-                            // Non-suspending when buffer has room so LLM tokens keep flowing.
-                            if (sentenceChannel.trySend(sentence).isFailure) {
-                                sentenceChannel.send(sentence)
+                            // Text first (Main), then hand audio to TTS.
+                            publishReplyUi(piece, startTalking = true)
+                            queuedTts.set(true)
+                            if (sentenceChannel.trySend(piece).isFailure) {
+                                sentenceChannel.send(piece)
                             }
                         },
                     )
@@ -281,8 +295,7 @@ class PetBrain @Inject constructor(
                     audioPipeline.stopSpeaking()
                     stopMouthAnimation()
                     val fallback = LlmPromptDefaults.DIDNT_CATCH_REPLY
-                    _currentResponse.value = fallback
-                    beginSpeakingUi()
+                    publishReplyUi(fallback, startTalking = true)
                     val cfg = sessionConfigStore.snapshot()
                     audioPipeline.speak(
                         fallback,
@@ -293,10 +306,15 @@ class PetBrain @Inject constructor(
                     stopMouthAnimation()
                     animationController.setExpression(PetExpression.THINKING)
                     uiFeedback.softNegative()
-                    _state.value = PetTurnState.Settling(PetExpression.THINKING)
+                    _state.value = PetTurnState.Settling(PetExpression.THINKING, fallback)
                     delay(EMOTION_DURATION_MS)
                     return@coroutineScope
                 }
+
+                val speakText = llmResponse.text.trim()
+                    .ifBlank { LlmPromptDefaults.DIDNT_CATCH_REPLY }
+                // Always paint final text before waiting on / starting audio.
+                publishReplyUi(speakText, startTalking = true)
 
                 val ttsStarted = SystemClock.elapsedRealtime()
                 withTimeoutOrNull(TTS_DRAIN_TIMEOUT_MS) { speakJob.await() }
@@ -307,12 +325,8 @@ class PetBrain @Inject constructor(
                 trace.ttsMs = SystemClock.elapsedRealtime() - ttsStarted
                 stopMouthAnimation()
 
-                val speakText = llmResponse.text.trim()
-                    .ifBlank { LlmPromptDefaults.DIDNT_CATCH_REPLY }
-                _currentResponse.value = speakText
-
-                if (!startedSpeaking.get() && speakText.isNotBlank()) {
-                    beginSpeakingUi()
+                // No streamed TTS pieces — speak the full reply now (text already on screen).
+                if (!queuedTts.get() && speakText.isNotBlank()) {
                     val cfg = sessionConfigStore.snapshot()
                     audioPipeline.speak(
                         speakText,
@@ -328,15 +342,28 @@ class PetBrain @Inject constructor(
                     properties = mapOf(
                         "expression" to llmResponse.expression.name,
                         "response_length" to llmResponse.text.length,
-                        "streamed_speech" to startedSpeaking.get(),
+                        "streamed_speech" to queuedTts.get(),
+                        "tool_app" to (llmResponse.toolCall?.intent?.id ?: ""),
+                        "tool_query" to (llmResponse.toolCall?.query ?: ""),
                     ),
                 )
+
+                // Open/play after speech so the confirmation is heard first.
+                llmResponse.toolCall?.let { call ->
+                    val ok = withContext(Dispatchers.Main) { appLauncher.launch(call) }
+                    if (!ok) {
+                        Log.w(
+                            TAG,
+                            "tool launch failed: ${call.intent.id} query=${call.query?.take(40)}",
+                        )
+                    }
+                }
 
                 animationController.setExpression(llmResponse.expression)
                 if (llmResponse.expression == PetExpression.HAPPY) {
                     uiFeedback.petEmotionPositive()
                 }
-                _state.value = PetTurnState.Settling(llmResponse.expression)
+                _state.value = PetTurnState.Settling(llmResponse.expression, speakText)
                 delay(EMOTION_DURATION_MS)
             }
         } catch (e: CancellationException) {
@@ -400,7 +427,7 @@ class PetBrain @Inject constructor(
             )
         }
         stopMouthAnimation()
-        _state.value = PetTurnState.Settling(PetExpression.THINKING)
+        _state.value = PetTurnState.Settling(PetExpression.THINKING, fallback)
         delay(EMOTION_DURATION_MS)
     }
 

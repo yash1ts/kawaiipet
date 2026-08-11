@@ -40,9 +40,11 @@ class AudioRecordManager {
         )
         if (minBuf == AudioRecord.ERROR_BAD_VALUE || minBuf == AudioRecord.ERROR) return false
 
-        val bufBytes = (minBuf * BUFFER_MULTIPLIER).coerceAtLeast(minBuf)
+        // Larger ring buffer absorbs scheduling jitter so we don't drop speech in noisy rooms.
+        val bufBytes = (minBuf * BUFFER_MULTIPLIER).coerceAtLeast(minBuf * 2)
 
-        // VOICE_RECOGNITION: tuned for ASR (less music EQ / less speakerphone AEC than VOICE_COMMUNICATION).
+        // VOICE_RECOGNITION: HW path tuned for ASR + system NS. Prefer over UNPROCESSED
+        // (raw) and VOICE_COMMUNICATION (heavy speakerphone EQ that can hurt Moonshine).
         val record = try {
             AudioRecord.Builder()
                 .setAudioSource(MediaRecorder.AudioSource.VOICE_RECOGNITION)
@@ -77,11 +79,17 @@ class AudioRecordManager {
 
         enableCaptureEffects(record.audioSessionId)
         isRecording = true
+        Log.i(
+            TAG,
+            "AudioRecord started source=VOICE_RECOGNITION rate=$sampleRate " +
+                "chunk=$CHUNK_SIZE bufBytes=$bufBytes ns=${noiseSuppressor != null} " +
+                "aec=${acousticEchoCanceler != null}",
+        )
         return true
     }
 
     private fun enableCaptureEffects(sessionId: Int) {
-        // Soft denoise helps in quiet rooms; keep AGC off in software path — we level in SttInputCleaner.
+        // Critical in cafes / street noise — enable whenever the OEM exposes it.
         if (NoiseSuppressor.isAvailable()) {
             try {
                 noiseSuppressor = NoiseSuppressor.create(sessionId)?.apply { enabled = true }
@@ -91,6 +99,8 @@ class AudioRecordManager {
                 noiseSuppressor?.release()
                 noiseSuppressor = null
             }
+        } else {
+            Log.w(TAG, "NoiseSuppressor not available on this device")
         }
         // AEC reduces pet-speaker bleed into the mic when the overlay is speaking nearby next turn.
         if (AcousticEchoCanceler.isAvailable()) {
@@ -103,7 +113,7 @@ class AudioRecordManager {
                 acousticEchoCanceler = null
             }
         }
-        // Prefer system AGC off — double AGC with SttInputCleaner makes VAD noisy.
+        // Keep system AGC off — double AGC with SttInputCleaner makes VAD thrash in noise.
         if (AutomaticGainControl.isAvailable()) {
             try {
                 automaticGainControl = AutomaticGainControl.create(sessionId)?.apply { enabled = false }
@@ -161,6 +171,7 @@ class AudioRecordManager {
         private const val TAG = "AudioRecordManager"
         /** 100ms chunks @ 16 kHz — snappier VAD than 200ms. */
         private const val CHUNK_SIZE = 1600
-        private const val BUFFER_MULTIPLIER = 4
+        /** Was 4; 6 reduces underruns when the UI/LLM thread is busy. */
+        private const val BUFFER_MULTIPLIER = 6
     }
 }

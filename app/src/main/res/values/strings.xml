@@ -16,7 +16,7 @@
     <string name="settings_title">Settings</string>
     <string name="settings_voice_section">Voice</string>
     <string name="settings_on_device_ai_section">On-device models</string>
-    <string name="settings_models_summary">Models download on first launch. Chat uses SmolLM2-360M via LiteRT-LM; voice uses Sherpa-ONNX (Moonshine STT + KittenTTS).</string>
+    <string name="settings_models_summary">Models download on first launch. Chat uses Qwen3-0.6B (no-think) via LiteRT-LM; voice uses Sherpa-ONNX (Moonshine STT + KittenTTS).</string>
     <string name="customize_title">Customize pet</string>
     <string name="home_tagline">Your AI companion, always by your side</string>
     <string name="home_models_ready">Ready — offline brain &amp; voice installed</string>

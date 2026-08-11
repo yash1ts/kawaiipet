@@ -32,13 +32,12 @@ private val OverlayChromeBottomInset = 10.dp
 
 /**
  * Bubble visibility must not depend on stale [responseText] after [OverlayState.Idle] (separate
- * StateFlows / frame ordering). Only Speaking and Processing-with-text show the bubble; listening
- * and text input use their own chrome.
+ * StateFlows / frame ordering). Show only when we have real reply text.
  */
 private fun bubbleVisible(state: OverlayState, responseText: String): Boolean {
+    if (responseText.isBlank()) return false
     return when (state) {
-        is OverlayState.Speaking -> true
-        is OverlayState.Processing -> responseText.isNotEmpty()
+        is OverlayState.Speaking, is OverlayState.Processing -> true
         else -> false
     }
 }
@@ -103,13 +102,8 @@ fun OverlayChromeWindowContent(
             // No AnimatedVisibility: exit animation recomposed with Idle + empty text, ChatBubble
             // early-returned, which broke exit and left the bubble stuck on screen.
             if (bubbleVisible(state, responseText)) {
-                val bubbleText = when {
-                    responseText.isNotBlank() -> responseText
-                    state is OverlayState.Speaking -> "…"
-                    else -> ""
-                }
                 ChatBubble(
-                    text = bubbleText,
+                    text = responseText,
                     modifier = Modifier
                         .widthIn(max = 200.dp)
                         .padding(bottom = 6.dp)

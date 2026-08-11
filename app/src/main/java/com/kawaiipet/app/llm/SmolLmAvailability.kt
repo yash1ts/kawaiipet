@@ -18,7 +18,7 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
 /**
- * Owns the on-device LiteRT-LM [Engine] backed by SmolLM2-360M-Instruct.
+ * Owns the on-device LiteRT-LM [Engine] backed by Qwen3-0.6B INT4 (no-think).
  */
 @Singleton
 class SmolLmAvailability @Inject constructor(
@@ -44,7 +44,7 @@ class SmolLmAvailability @Inject constructor(
         engine?.let { return it }
         val path = modelFile().absolutePath
         if (!isModelOnDisk()) {
-            error("SmolLM2 model missing at $path")
+            error("Qwen3 model missing at $path")
         }
         withContext(Dispatchers.Default) {
             Engine.setNativeMinLogSeverity(LogSeverity.ERROR)
@@ -60,7 +60,7 @@ class SmolLmAvailability @Inject constructor(
                     val config = EngineConfig(
                         modelPath = path,
                         backend = backend,
-                        // Smaller KV = faster prefill/allocate for short pet turns.
+                        // Must be <= model KV (ekv1280). Smaller = faster allocate for short turns.
                         maxNumTokens = MAX_NUM_TOKENS,
                         cacheDir = context.cacheDir.absolutePath,
                     )
@@ -82,7 +82,7 @@ class SmolLmAvailability @Inject constructor(
 
     suspend fun warmUp() {
         runCatching { ensureReady() }
-            .onFailure { Log.w(TAG, "SmolLM2 warmUp failed", it) }
+            .onFailure { Log.w(TAG, "Qwen3 warmUp failed", it) }
     }
 
     fun close() {
@@ -93,7 +93,7 @@ class SmolLmAvailability @Inject constructor(
 
     companion object {
         private const val TAG = "SmolLmAvailability"
-        // System + short-term window + reply. Model context is 4096; keep headroom.
-        private const val MAX_NUM_TOKENS = 2048
+        /** Matches qwen3_*_ekv1280.litertlm KV cache length. */
+        private const val MAX_NUM_TOKENS = 1280
     }
 }

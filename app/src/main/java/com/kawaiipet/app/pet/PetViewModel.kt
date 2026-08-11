@@ -53,7 +53,7 @@ class PetViewModel(
             PetTurnState.Transcribing -> OverlayState.Processing("")
             is PetTurnState.Thinking -> OverlayState.Processing(userText)
             is PetTurnState.Speaking -> OverlayState.Speaking(text)
-            is PetTurnState.Settling -> OverlayState.Speaking("")
+            is PetTurnState.Settling -> OverlayState.Speaking(text)
         }
     }
 }

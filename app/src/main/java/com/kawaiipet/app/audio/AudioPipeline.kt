@@ -39,6 +39,7 @@ class AudioPipeline(
     private val appContext: Context,
     private val stt: SherpaSTT,
     private val tts: SherpaTTS,
+    private val vad: SherpaVad,
     private val recorder: AudioRecordManager,
     private val player: AudioTrackManager,
     private val preferenceManager: PreferenceManager,
@@ -60,9 +61,11 @@ class AudioPipeline(
 
     val isSttReady: Boolean get() = stt.isInitialized
     val isTtsReady: Boolean get() = tts.isInitialized
+    val isVadReady: Boolean get() = vad.isInitialized
 
     fun initializeSTT(modelId: String): Boolean = stt.initialize(modelId)
     fun initializeTTS(modelId: String): Boolean = tts.initialize(modelId)
+    fun initializeVad(): Boolean = vad.initialize()
 
     /**
      * One discarded synth so Kitten's first real sentence isn't a cold kernel compile.
@@ -91,6 +94,8 @@ class AudioPipeline(
         if (petVoicePrepareJob?.isActive == true) return
         petVoicePrepareJob = scope.launch(Dispatchers.Default) {
             try {
+                val vadOk = initializeVad()
+                Log.d(TAG, "Pet voice prepare: Silero VAD success=$vadOk")
                 if (loadStt && sttId.isNotBlank()) {
                     val ok = initializeSTT(sttId)
                     Log.d(TAG, "Pet voice prepare: STT id=$sttId success=$ok")
@@ -135,9 +140,9 @@ class AudioPipeline(
 
     /**
      * Listens for speech, transcribes it, and returns the text.
-     * Uses VAD (voice activity detection) to auto-detect when the user stops speaking.
+     * Silero VAD detects when the user starts/stops speaking.
      *
-     * Priority: Sherpa STT → Platform SpeechRecognizer → Raw audio VAD (no transcription).
+     * Priority: Sherpa STT → Platform SpeechRecognizer → Silero VAD only (no transcription).
      */
     suspend fun listenAndTranscribe(
         timeoutMs: Long = DEFAULT_LISTEN_TIMEOUT_MS,
@@ -152,7 +157,7 @@ class AudioPipeline(
                 stt.isInitialized -> listenWithSherpa(awaitTimeoutMs)
                 isPlatformSttAvailable() -> listenWithPlatformSpeechRecognizer(onPartialText, awaitTimeoutMs)
                 else -> {
-                    Log.d(TAG, "No STT available, using raw VAD")
+                    Log.d(TAG, "No STT available, using Silero VAD only")
                     listenWithVadOnly(awaitTimeoutMs, onPartialText)
                 }
             }
@@ -171,142 +176,94 @@ class AudioPipeline(
     }
 
     private suspend fun listenWithSherpa(timeoutMs: Long): String {
+        if (!vad.isInitialized && !initializeVad()) {
+            Log.e(TAG, "Silero VAD required but not ready")
+            return ""
+        }
         stt.startStream()
         sttInputCleaner.reset()
+        vad.reset()
         if (!recorder.start()) return ""
 
         val result = CompletableDeferred<String>()
-        var silenceCount = 0
         var leadingSilenceChunks = 0
-        var speechFrameCount = 0
         var speechChunksTotal = 0
+        var speechConfirmChunks = 0
         var hasSpeechHint = false
         var speechHintStartedAt = 0L
-        /** Decaying speech peak — absolute peak made end-of-speech require shouting. */
-        var speechPeak = 0f
-        var speechLevel = 0f
-        var noiseFloor = 0.006f
-        var noiseSamples = 0
+        var nonSpeechChunks = 0
         val recordingStartedAt = SystemClock.elapsedRealtime()
-        // Keep a short pre-roll so ASR still hears word onsets after VAD trips.
         val preRoll = ArrayDeque<FloatArray>(PRE_SPEECH_LOOKBACK_CHUNKS + 1)
 
         recordJob = scope.launch {
             recorder.readLoop { samples ->
                 val now = SystemClock.elapsedRealtime()
                 if (now - recordingStartedAt >= MAX_RECORDING_DURATION_MS) {
-                    Log.d(TAG, "Sherpa: max recording duration reached")
+                    Log.d(TAG, "Silero: max recording duration reached")
                     finishListen(result)
                     return@readLoop
                 }
 
-                // VAD on speech-band energy (no AGC). Feed leveled audio to the model.
-                val energy = sttInputCleaner.speechBandRms(samples)
+                // Silero on ungained PCM; Moonshine on leveled PCM.
+                val vadSamples = sttInputCleaner.pcm16ToFloat(samples)
                 val floatSamples = sttInputCleaner.cleanPcm16ToFloat(samples)
-
-                if (hasSpeechHint && stt.isEndpoint()) {
-                    finishListen(result)
-                    return@readLoop
-                }
-
-                // Calibrate + keep adapting ambient noise (slow rise / faster fall).
-                if (!hasSpeechHint && noiseSamples < NOISE_CALIBRATION_CHUNKS) {
-                    noiseFloor = if (noiseSamples == 0) {
-                        energy.coerceAtLeast(0.002f)
-                    } else {
-                        noiseFloor * 0.80f + energy * 0.20f
-                    }
-                    noiseSamples++
-                } else if (!hasSpeechHint || energy < noiseFloor + END_MARGIN * 3f) {
-                    noiseFloor = adaptNoiseFloor(noiseFloor, energy)
-                }
-
-                val speechGate = speechGate(noiseFloor)
-                val snr = (energy - noiseFloor) / maxOf(noiseFloor, 0.002f)
-                val isSpeech = energy >= speechGate || snr >= SPEECH_SNR
+                val isSpeech = vad.acceptAndIsSpeech(vadSamples)
+                // Completed Silero segments mark a clean utterance end — don't re-feed
+                // samples (already streamed live into Moonshine).
+                val segmentEnded = vad.drainSegments().isNotEmpty()
 
                 if (isSpeech) {
-                    speechFrameCount++
-                    speechPeak = maxOf(speechPeak * 0.92f, energy)
-                    speechLevel = if (speechLevel <= 0f) energy else speechLevel * 0.65f + energy * 0.35f
-                    silenceCount = 0
+                    nonSpeechChunks = 0
                     leadingSilenceChunks = 0
-                    if (!hasSpeechHint && speechFrameCount >= MIN_SPEECH_FRAMES) {
-                        hasSpeechHint = true
-                        speechHintStartedAt = now
-                        // Flush lookback + current chunk so Moonshine isn't starved of onsets.
-                        while (preRoll.isNotEmpty()) {
-                            stt.acceptWaveform(preRoll.removeFirst())
+                    speechConfirmChunks++
+                    pushPreRoll(preRoll, floatSamples)
+                    if (!hasSpeechHint) {
+                        if (speechConfirmChunks >= VadEngineConfig.SPEECH_START_CONFIRM_CHUNKS) {
+                            hasSpeechHint = true
+                            speechHintStartedAt = now
+                            while (preRoll.isNotEmpty()) {
+                                stt.acceptWaveform(preRoll.removeFirst())
+                            }
+                            // Confirm chunks + lookback already fed via pre-roll.
+                            speechChunksTotal = speechConfirmChunks
+                            Log.d(TAG, "Silero: speech start confirm=$speechConfirmChunks")
                         }
-                        stt.acceptWaveform(floatSamples)
-                        Log.d(
-                            TAG,
-                            "Sherpa: speech start e=%.4f gate=%.4f noise=%.4f snr=%.2f".format(
-                                energy,
-                                speechGate,
-                                noiseFloor,
-                                snr,
-                            ),
-                        )
-                    } else if (hasSpeechHint) {
-                        stt.acceptWaveform(floatSamples)
                     } else {
-                        pushPreRoll(preRoll, floatSamples)
+                        stt.acceptWaveform(floatSamples)
+                        speechChunksTotal++
                     }
-                    if (hasSpeechHint) speechChunksTotal++
                 } else {
-                    speechFrameCount = 0
-                    // Decay peak so a loud first word doesn't freeze a high end threshold.
-                    speechPeak *= 0.90f
+                    speechConfirmChunks = 0
                     if (!hasSpeechHint) {
                         pushPreRoll(preRoll, floatSamples)
                         leadingSilenceChunks++
                         if (leadingSilenceChunks > LEADING_SILENCE_CHUNKS) {
-                            Log.d(
-                                TAG,
-                                "Sherpa: no speech (noise=%.4f gate=%.4f)".format(
-                                    noiseFloor,
-                                    speechGate,
-                                ),
-                            )
+                            Log.d(TAG, "Silero: no speech")
                             recorder.stop()
                             result.complete("")
                             return@readLoop
                         }
                     } else {
-                        // Do not feed trailing silence into Moonshine — decode cost scales
-                        // with audio length. Buffer only to flush if speech resumes.
-                        val endFloor = endOfSpeechFloor(noiseFloor, speechPeak, speechLevel)
-                        if (energy <= endFloor && speechChunksTotal >= MIN_SPEECH_CHUNKS_BEFORE_END) {
-                            silenceCount++
-                        } else {
-                            // Noise blip / soft speech: flush pending silence then continue.
-                            if (silenceCount > 0) silenceCount--
-                            stt.acceptWaveform(floatSamples)
-                        }
+                        nonSpeechChunks++
                     }
+                }
+
+                if (hasSpeechHint && speechChunksTotal >= MIN_SPEECH_CHUNKS_BEFORE_END &&
+                    (segmentEnded || nonSpeechChunks > VadEngineConfig.SILENCE_END_CHUNKS)
+                ) {
+                    Log.d(
+                        TAG,
+                        "Silero: end segment=$segmentEnded silence=$nonSpeechChunks " +
+                            "voiced=$speechChunksTotal",
+                    )
+                    finishListen(result)
+                    return@readLoop
                 }
 
                 if (hasSpeechHint && speechHintStartedAt > 0L &&
                     now - speechHintStartedAt >= MAX_UTTERANCE_AFTER_SPEECH_MS
                 ) {
-                    Log.d(TAG, "Sherpa: max utterance length reached")
-                    finishListen(result)
-                    return@readLoop
-                }
-
-                if (hasSpeechHint && silenceCount > SILENCE_CHUNKS_AFTER_SPEECH) {
-                    val endFloor = endOfSpeechFloor(noiseFloor, speechPeak, speechLevel)
-                    Log.d(
-                        TAG,
-                        "Sherpa: end silence e=%.4f floor=%.4f noise=%.4f chunks=%d voiced=%d".format(
-                            energy,
-                            endFloor,
-                            noiseFloor,
-                            silenceCount,
-                            speechChunksTotal,
-                        ),
-                    )
+                    Log.d(TAG, "Silero: max utterance length reached")
                     finishListen(result)
                     return@readLoop
                 }
@@ -314,7 +271,6 @@ class AudioPipeline(
         }
 
         val awaited = withTimeoutOrNull(timeoutMs) { result.await() }
-        // Decode in parallel with releasing the mic / AEC effects.
         val textDeferred = scope.async(Dispatchers.Default) {
             awaited ?: finalizeSherpaTranscript()
         }
@@ -432,85 +388,68 @@ class AudioPipeline(
     }
 
     /**
-     * Fallback: record raw audio and use energy-based VAD to detect when the user
-     * starts and stops speaking. No transcription — returns "[voice]" when speech
-     * was detected so the caller knows it happened.
+     * Fallback when STT isn't loaded: Silero detects speech start/end only.
+     * Returns "[voice]" when speech was heard.
      */
     private suspend fun listenWithVadOnly(
         timeoutMs: Long,
         onPartialText: (String) -> Unit
     ): String = withContext(Dispatchers.IO) {
+        if (!vad.isInitialized && !initializeVad()) {
+            Log.e(TAG, "Silero VAD not ready")
+            return@withContext ""
+        }
         if (!recorder.start()) {
-            Log.e(TAG, "VAD: failed to start recorder")
+            Log.e(TAG, "Silero: failed to start recorder")
             return@withContext ""
         }
 
-        Log.d(TAG, "VAD: recording started")
+        Log.d(TAG, "Silero VAD-only: recording started")
         onPartialText("Listening…")
+        vad.reset()
+        sttInputCleaner.reset()
 
         val result = CompletableDeferred<Boolean>()
-        var silenceFrames = 0
-        var speechFrames = 0
+        var nonSpeechChunks = 0
+        var speechConfirmChunks = 0
         var speechChunksTotal = 0
         var hasSpeechStarted = false
-        var speechPeak = 0f
-        var speechLevel = 0f
-        var noiseFloor = 0.006f
-        var noiseSamples = 0
         val recordingStartedAt = SystemClock.elapsedRealtime()
-        val cleaner = SttInputCleaner()
 
         recordJob = scope.launch {
             recorder.readLoop { samples ->
                 if (SystemClock.elapsedRealtime() - recordingStartedAt >= MAX_RECORDING_DURATION_MS) {
-                    Log.d(TAG, "VAD: max recording duration reached")
+                    Log.d(TAG, "Silero: max recording duration reached")
                     result.complete(hasSpeechStarted)
                     return@readLoop
                 }
 
-                val energy = cleaner.speechBandRms(samples)
-                if (!hasSpeechStarted && noiseSamples < NOISE_CALIBRATION_CHUNKS) {
-                    noiseFloor = if (noiseSamples == 0) {
-                        energy.coerceAtLeast(0.002f)
-                    } else {
-                        noiseFloor * 0.80f + energy * 0.20f
-                    }
-                    noiseSamples++
-                } else if (!hasSpeechStarted || energy < noiseFloor + END_MARGIN * 3f) {
-                    noiseFloor = adaptNoiseFloor(noiseFloor, energy)
-                }
-
-                val gate = speechGate(noiseFloor)
-                val snr = (energy - noiseFloor) / maxOf(noiseFloor, 0.002f)
-                val isSpeech = energy >= gate || snr >= SPEECH_SNR
+                val vadSamples = sttInputCleaner.pcm16ToFloat(samples)
+                val isSpeech = vad.acceptAndIsSpeech(vadSamples)
+                val segmentEnded = vad.drainSegments().isNotEmpty()
 
                 if (isSpeech) {
-                    speechFrames++
-                    speechPeak = maxOf(speechPeak * 0.92f, energy)
-                    speechLevel = if (speechLevel <= 0f) energy else speechLevel * 0.65f + energy * 0.35f
-                    silenceFrames = 0
-                    if (speechFrames >= MIN_SPEECH_FRAMES && !hasSpeechStarted) {
+                    nonSpeechChunks = 0
+                    speechConfirmChunks++
+                    if (!hasSpeechStarted &&
+                        speechConfirmChunks >= VadEngineConfig.SPEECH_START_CONFIRM_CHUNKS
+                    ) {
                         hasSpeechStarted = true
-                        Log.d(TAG, "VAD: speech detected e=%.4f noise=%.4f".format(energy, noiseFloor))
+                        Log.d(TAG, "Silero: speech detected")
                         onPartialText("Speaking…")
                     }
                     if (hasSpeechStarted) speechChunksTotal++
                 } else {
-                    speechFrames = 0
-                    speechPeak *= 0.90f
-                    if (hasSpeechStarted) {
-                        val endFloor = endOfSpeechFloor(noiseFloor, speechPeak, speechLevel)
-                        if (energy <= endFloor && speechChunksTotal >= MIN_SPEECH_CHUNKS_BEFORE_END) {
-                            silenceFrames++
-                            if (silenceFrames > SILENCE_CHUNKS_AFTER_SPEECH) {
-                                Log.d(TAG, "VAD: silence after speech, stopping")
-                                result.complete(true)
-                                return@readLoop
-                            }
-                        } else if (silenceFrames > 0) {
-                            silenceFrames--
-                        }
-                    }
+                    speechConfirmChunks = 0
+                    if (hasSpeechStarted) nonSpeechChunks++
+                }
+
+                if (hasSpeechStarted && speechChunksTotal >= MIN_SPEECH_CHUNKS_BEFORE_END &&
+                    (segmentEnded || nonSpeechChunks > VadEngineConfig.SILENCE_END_CHUNKS)
+                ) {
+                    Log.d(TAG, "Silero: silence after speech, stopping")
+                    result.complete(true)
+                    return@readLoop
                 }
             }
         }
@@ -642,31 +581,12 @@ class AudioPipeline(
         player.release()
         stt.release()
         tts.release()
+        vad.release()
         _enginesReady.value = false
     }
 
     companion object {
         private const val TAG = "AudioPipeline"
-        private fun rmsOfFloats(samples: FloatArray): Double {
-            if (samples.isEmpty()) return 0.0
-            var sum = 0.0
-            for (x in samples) {
-                val d = x.toDouble()
-                sum += d * d
-            }
-            return sum / samples.size
-        }
-
-        private fun rmsOfPcm16(samples: ShortArray): Double {
-            if (samples.isEmpty()) return 0.0
-            val scale = 1.0 / Short.MAX_VALUE
-            var sum = 0.0
-            for (s in samples) {
-                val x = s * scale
-                sum += x * x
-            }
-            return sum / samples.size
-        }
 
         /** Hard cap so long continuous speech does not hit client timeouts with empty STT. */
         private const val MAX_RECORDING_DURATION_MS = 30_000L
@@ -674,38 +594,11 @@ class AudioPipeline(
         /** Default wall-clock budget for listen (must allow [MAX_RECORDING_DURATION_MS] to elapse). */
         private const val DEFAULT_LISTEN_TIMEOUT_MS = 35_000L
 
-        /** First chunks used to estimate ambient noise (100ms each). */
-        private const val NOISE_CALIBRATION_CHUNKS = 10
+        /** Don't cut off until we've heard ~500ms of voiced audio. */
+        private const val MIN_SPEECH_CHUNKS_BEFORE_END = 5
 
-        /** Absolute margin above noise floor to count as speech. */
-        private const val SPEECH_MARGIN = 0.0032f
-        private const val MIN_SPEECH_GATE = 0.005f
-
-        /**
-         * Relative SNR: (energy - noise) / noise. Lets quiet speech win in a quiet room
-         * and still reject steady background noise.
-         */
-        private const val SPEECH_SNR = 1.25f
-
-        /** End-of-speech: just above ambient, relative to recent speech level. */
-        private const val END_MARGIN = 0.0022f
-        private const val MIN_END_FLOOR = 0.003f
-        private const val SPEECH_END_RATIO = 0.38f
-        private const val SPEECH_LEVEL_END_RATIO = 0.46f
-        /** Cap so loud first syllables don't lock a high end threshold. */
-        private const val MAX_END_ABOVE_NOISE = 0.018f
-
-        /** Need this many speech chunks before we treat it as real speech (~200ms). */
-        private const val MIN_SPEECH_FRAMES = 2
-
-        /** Don't cut off until we've heard ~400ms of voiced audio. */
-        private const val MIN_SPEECH_CHUNKS_BEFORE_END = 4
-
-        /** ~100ms per chunk — 9 ≈ 0.9s trailing silence (was 1.6s). */
-        private const val SILENCE_CHUNKS_AFTER_SPEECH = 9
-
-        /** Keep ~300ms before VAD speech-start so first phonemes aren't clipped for offline ASR. */
-        private const val PRE_SPEECH_LOOKBACK_CHUNKS = 3
+        /** Keep ~400ms before VAD speech-start so first phonemes aren't clipped for offline ASR. */
+        private const val PRE_SPEECH_LOOKBACK_CHUNKS = 4
 
         /** ~250ms of zeros appended before offline decode. */
         private const val TRAILING_PAD_SAMPLES = SttEngineConfig.SAMPLE_RATE / 4
@@ -715,33 +608,5 @@ class AudioPipeline(
 
         /** Hard stop after speech was detected. */
         private const val MAX_UTTERANCE_AFTER_SPEECH_MS = 10_000L
-
-        private fun adaptNoiseFloor(floor: Float, energy: Float): Float {
-            val e = energy.coerceAtLeast(0.001f)
-            return if (e < floor) {
-                // Track downward quickly when the room gets quieter.
-                floor * 0.88f + e * 0.12f
-            } else {
-                // Rise slowly so brief spikes don't raise the gate.
-                floor * 0.985f + e * 0.015f
-            }
-        }
-
-        private fun speechGate(noiseFloor: Float): Float =
-            maxOf(MIN_SPEECH_GATE, noiseFloor + SPEECH_MARGIN, noiseFloor * (1f + SPEECH_SNR * 0.35f))
-
-        private fun endOfSpeechFloor(
-            noiseFloor: Float,
-            speechPeak: Float,
-            speechLevel: Float,
-        ): Float {
-            val relative = maxOf(
-                speechPeak * SPEECH_END_RATIO,
-                speechLevel * SPEECH_LEVEL_END_RATIO,
-            )
-            val aboveNoise = noiseFloor + END_MARGIN
-            val uncapped = maxOf(MIN_END_FLOOR, aboveNoise, relative)
-            return minOf(uncapped, noiseFloor + MAX_END_ABOVE_NOISE)
-        }
     }
 }
