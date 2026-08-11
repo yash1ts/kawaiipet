@@ -6,16 +6,15 @@ import javax.inject.Inject
 import javax.inject.Singleton
 
 /**
- * Legacy entry point — forwards to [MemoryPipeline] (paragraph memory + utility LLM).
- * Prefer injecting [MemoryPipeline] directly in new code.
+ * Legacy entry point — session turns are recorded on [MemoryPipeline]; flush happens on Home.
  */
 @Singleton
 class FactExtractor @Inject constructor(
     private val memoryPipeline: MemoryPipeline,
 ) {
     fun extractAndStoreAsync(userText: String, assistantText: String) {
-        Log.d(TAG, "Forwarding turn to MemoryPipeline")
-        memoryPipeline.scheduleConsolidate(userText, assistantText)
+        Log.d(TAG, "Recording turn for later session flush")
+        memoryPipeline.recordTurn(userText, assistantText)
     }
 
     companion object {

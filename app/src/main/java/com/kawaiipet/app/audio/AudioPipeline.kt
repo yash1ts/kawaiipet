@@ -147,8 +147,10 @@ class AudioPipeline(
         var speechChunksTotal = 0
         var hasSpeechHint = false
         var speechHintStartedAt = 0L
-        var peakSpeechRms = 0f
-        var noiseFloor = 0f
+        /** Decaying speech peak — absolute peak made end-of-speech require shouting. */
+        var speechPeak = 0f
+        var speechLevel = 0f
+        var noiseFloor = 0.006f
         var noiseSamples = 0
         val recordingStartedAt = SystemClock.elapsedRealtime()
 
@@ -161,8 +163,8 @@ class AudioPipeline(
                     return@readLoop
                 }
 
-                // VAD on raw mic energy (before AGC). Feed leveled audio to the model.
-                val rawRms = sttInputCleaner.rawRms(samples)
+                // VAD on speech-band energy (no AGC). Feed leveled audio to the model.
+                val energy = sttInputCleaner.speechBandRms(samples)
                 val floatSamples = sttInputCleaner.cleanPcm16ToFloat(samples)
                 stt.acceptWaveform(floatSamples)
 
@@ -171,33 +173,26 @@ class AudioPipeline(
                     return@readLoop
                 }
 
-                // Calibrate ambient noise from the first quiet chunks.
+                // Calibrate + keep adapting ambient noise (slow rise / faster fall).
                 if (!hasSpeechHint && noiseSamples < NOISE_CALIBRATION_CHUNKS) {
                     noiseFloor = if (noiseSamples == 0) {
-                        rawRms
+                        energy.coerceAtLeast(0.002f)
                     } else {
-                        noiseFloor * 0.85f + rawRms * 0.15f
+                        noiseFloor * 0.80f + energy * 0.20f
                     }
                     noiseSamples++
+                } else if (!hasSpeechHint || energy < noiseFloor + END_MARGIN * 3f) {
+                    noiseFloor = adaptNoiseFloor(noiseFloor, energy)
                 }
 
-                val speechGate = maxOf(MIN_SPEECH_GATE, noiseFloor + SPEECH_MARGIN)
-                val endFloor = if (hasSpeechHint && peakSpeechRms > 0f) {
-                    maxOf(
-                        MIN_END_FLOOR,
-                        noiseFloor + END_MARGIN,
-                        peakSpeechRms * SPEECH_END_RATIO,
-                    )
-                } else {
-                    speechGate
-                }
+                val speechGate = speechGate(noiseFloor)
+                val snr = (energy - noiseFloor) / maxOf(noiseFloor, 0.002f)
+                val isSpeech = energy >= speechGate || snr >= SPEECH_SNR
 
-                val isLoud = rawRms > speechGate
-                val isSilent = rawRms <= endFloor
-
-                if (isLoud) {
+                if (isSpeech) {
                     speechFrameCount++
-                    peakSpeechRms = maxOf(peakSpeechRms, rawRms)
+                    speechPeak = maxOf(speechPeak * 0.92f, energy)
+                    speechLevel = if (speechLevel <= 0f) energy else speechLevel * 0.65f + energy * 0.35f
                     silenceCount = 0
                     leadingSilenceChunks = 0
                     if (!hasSpeechHint && speechFrameCount >= MIN_SPEECH_FRAMES) {
@@ -205,16 +200,19 @@ class AudioPipeline(
                         speechHintStartedAt = now
                         Log.d(
                             TAG,
-                            "Sherpa: speech start rawRms=%.4f gate=%.4f noise=%.4f".format(
-                                rawRms,
+                            "Sherpa: speech start e=%.4f gate=%.4f noise=%.4f snr=%.2f".format(
+                                energy,
                                 speechGate,
                                 noiseFloor,
+                                snr,
                             ),
                         )
                     }
                     if (hasSpeechHint) speechChunksTotal++
                 } else {
                     speechFrameCount = 0
+                    // Decay peak so a loud first word doesn't freeze a high end threshold.
+                    speechPeak *= 0.90f
                     if (!hasSpeechHint) {
                         leadingSilenceChunks++
                         if (leadingSilenceChunks > LEADING_SILENCE_CHUNKS) {
@@ -229,10 +227,13 @@ class AudioPipeline(
                             result.complete("")
                             return@readLoop
                         }
-                    } else if (isSilent) {
-                        // Don't end on the first brief dip — need enough voiced audio first.
-                        if (speechChunksTotal >= MIN_SPEECH_CHUNKS_BEFORE_END) {
+                    } else {
+                        val endFloor = endOfSpeechFloor(noiseFloor, speechPeak, speechLevel)
+                        if (energy <= endFloor && speechChunksTotal >= MIN_SPEECH_CHUNKS_BEFORE_END) {
                             silenceCount++
+                        } else {
+                            // Background noise blip — don't accumulate forever, ease off slowly.
+                            if (silenceCount > 0) silenceCount--
                         }
                     }
                 }
@@ -246,11 +247,13 @@ class AudioPipeline(
                 }
 
                 if (hasSpeechHint && silenceCount > SILENCE_CHUNKS_AFTER_SPEECH) {
+                    val endFloor = endOfSpeechFloor(noiseFloor, speechPeak, speechLevel)
                     Log.d(
                         TAG,
-                        "Sherpa: end silence rawRms=%.4f floor=%.4f chunks=%d voiced=%d".format(
-                            rawRms,
+                        "Sherpa: end silence e=%.4f floor=%.4f noise=%.4f chunks=%d voiced=%d".format(
+                            energy,
                             endFloor,
+                            noiseFloor,
                             silenceCount,
                             speechChunksTotal,
                         ),
@@ -381,8 +384,14 @@ class AudioPipeline(
         val result = CompletableDeferred<Boolean>()
         var silenceFrames = 0
         var speechFrames = 0
+        var speechChunksTotal = 0
         var hasSpeechStarted = false
+        var speechPeak = 0f
+        var speechLevel = 0f
+        var noiseFloor = 0.006f
+        var noiseSamples = 0
         val recordingStartedAt = SystemClock.elapsedRealtime()
+        val cleaner = SttInputCleaner()
 
         recordJob = scope.launch {
             recorder.readLoop { samples ->
@@ -392,24 +401,47 @@ class AudioPipeline(
                     return@readLoop
                 }
 
-                val rms = sqrt(rmsOfPcm16(samples)).toFloat()
+                val energy = cleaner.speechBandRms(samples)
+                if (!hasSpeechStarted && noiseSamples < NOISE_CALIBRATION_CHUNKS) {
+                    noiseFloor = if (noiseSamples == 0) {
+                        energy.coerceAtLeast(0.002f)
+                    } else {
+                        noiseFloor * 0.80f + energy * 0.20f
+                    }
+                    noiseSamples++
+                } else if (!hasSpeechStarted || energy < noiseFloor + END_MARGIN * 3f) {
+                    noiseFloor = adaptNoiseFloor(noiseFloor, energy)
+                }
 
-                if (rms > MIN_SPEECH_GATE) {
+                val gate = speechGate(noiseFloor)
+                val snr = (energy - noiseFloor) / maxOf(noiseFloor, 0.002f)
+                val isSpeech = energy >= gate || snr >= SPEECH_SNR
+
+                if (isSpeech) {
                     speechFrames++
+                    speechPeak = maxOf(speechPeak * 0.92f, energy)
+                    speechLevel = if (speechLevel <= 0f) energy else speechLevel * 0.65f + energy * 0.35f
                     silenceFrames = 0
-
                     if (speechFrames >= MIN_SPEECH_FRAMES && !hasSpeechStarted) {
                         hasSpeechStarted = true
-                        Log.d(TAG, "VAD: speech detected")
+                        Log.d(TAG, "VAD: speech detected e=%.4f noise=%.4f".format(energy, noiseFloor))
                         onPartialText("Speaking…")
                     }
+                    if (hasSpeechStarted) speechChunksTotal++
                 } else {
+                    speechFrames = 0
+                    speechPeak *= 0.90f
                     if (hasSpeechStarted) {
-                        silenceFrames++
-                        if (silenceFrames > SILENCE_CHUNKS_AFTER_SPEECH) {
-                            Log.d(TAG, "VAD: silence after speech, stopping")
-                            result.complete(true)
-                            return@readLoop
+                        val endFloor = endOfSpeechFloor(noiseFloor, speechPeak, speechLevel)
+                        if (energy <= endFloor && speechChunksTotal >= MIN_SPEECH_CHUNKS_BEFORE_END) {
+                            silenceFrames++
+                            if (silenceFrames > SILENCE_CHUNKS_AFTER_SPEECH) {
+                                Log.d(TAG, "VAD: silence after speech, stopping")
+                                result.complete(true)
+                                return@readLoop
+                            }
+                        } else if (silenceFrames > 0) {
+                            silenceFrames--
                         }
                     }
                 }
@@ -555,30 +587,67 @@ class AudioPipeline(
         private const val DEFAULT_LISTEN_TIMEOUT_MS = 35_000L
 
         /** First chunks used to estimate ambient noise (100ms each). */
-        private const val NOISE_CALIBRATION_CHUNKS = 8
+        private const val NOISE_CALIBRATION_CHUNKS = 10
 
-        /** Speech must exceed noise floor by this much. */
-        private const val SPEECH_MARGIN = 0.012f
-        private const val MIN_SPEECH_GATE = 0.018f
+        /** Absolute margin above noise floor to count as speech. */
+        private const val SPEECH_MARGIN = 0.004f
+        private const val MIN_SPEECH_GATE = 0.006f
 
-        /** End-of-speech floor relative to noise / peak. */
-        private const val END_MARGIN = 0.006f
-        private const val MIN_END_FLOOR = 0.010f
-        private const val SPEECH_END_RATIO = 0.35f
+        /**
+         * Relative SNR: (energy - noise) / noise. Lets quiet speech win in a quiet room
+         * and still reject steady background noise.
+         */
+        private const val SPEECH_SNR = 1.35f
 
-        /** Need this many loud chunks before we treat it as real speech (~200ms). */
+        /** End-of-speech: just above ambient, relative to recent speech level. */
+        private const val END_MARGIN = 0.0025f
+        private const val MIN_END_FLOOR = 0.0035f
+        private const val SPEECH_END_RATIO = 0.42f
+        private const val SPEECH_LEVEL_END_RATIO = 0.50f
+        /** Cap so loud first syllables don't lock a high end threshold. */
+        private const val MAX_END_ABOVE_NOISE = 0.018f
+
+        /** Need this many speech chunks before we treat it as real speech (~200ms). */
         private const val MIN_SPEECH_FRAMES = 2
 
-        /** Don't cut off until we've heard ~400ms of voiced audio. */
-        private const val MIN_SPEECH_CHUNKS_BEFORE_END = 4
+        /** Don't cut off until we've heard ~300ms of voiced audio. */
+        private const val MIN_SPEECH_CHUNKS_BEFORE_END = 3
 
-        /** ~100ms per chunk — 12 ≈ 1.2s trailing silence. */
-        private const val SILENCE_CHUNKS_AFTER_SPEECH = 12
+        /** ~100ms per chunk — 10 ≈ 1.0s trailing silence. */
+        private const val SILENCE_CHUNKS_AFTER_SPEECH = 10
 
         /** ~100ms per chunk — 100 ≈ 10s with no voiced audio. */
         private const val LEADING_SILENCE_CHUNKS = 100
 
         /** Hard stop after speech was detected. */
         private const val MAX_UTTERANCE_AFTER_SPEECH_MS = 10_000L
+
+        private fun adaptNoiseFloor(floor: Float, energy: Float): Float {
+            val e = energy.coerceAtLeast(0.001f)
+            return if (e < floor) {
+                // Track downward quickly when the room gets quieter.
+                floor * 0.88f + e * 0.12f
+            } else {
+                // Rise slowly so brief spikes don't raise the gate.
+                floor * 0.985f + e * 0.015f
+            }
+        }
+
+        private fun speechGate(noiseFloor: Float): Float =
+            maxOf(MIN_SPEECH_GATE, noiseFloor + SPEECH_MARGIN, noiseFloor * (1f + SPEECH_SNR * 0.35f))
+
+        private fun endOfSpeechFloor(
+            noiseFloor: Float,
+            speechPeak: Float,
+            speechLevel: Float,
+        ): Float {
+            val relative = maxOf(
+                speechPeak * SPEECH_END_RATIO,
+                speechLevel * SPEECH_LEVEL_END_RATIO,
+            )
+            val aboveNoise = noiseFloor + END_MARGIN
+            val uncapped = maxOf(MIN_END_FLOOR, aboveNoise, relative)
+            return minOf(uncapped, noiseFloor + MAX_END_ABOVE_NOISE)
+        }
     }
 }

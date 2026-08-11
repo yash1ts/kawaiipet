@@ -104,6 +104,10 @@ class PetOverlayService : Service() {
             } else {
                 Log.w(TAG, "TRIGGER_AI before ViewModel ready")
             }
+        } else {
+            // Fresh short-term chat each Start Pet (Home button, shortcut, tile).
+            conversationManager.clearConversation()
+            Log.d(TAG, "Short-term memory cleared for new pet session")
         }
         return START_STICKY
     }

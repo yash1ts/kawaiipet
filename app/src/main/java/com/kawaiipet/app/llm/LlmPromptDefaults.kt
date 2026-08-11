@@ -3,8 +3,7 @@ package com.kawaiipet.app.llm
 /**
  * Prompt + sampler defaults for on-device SmolLM2-135M-Instruct via LiteRT-LM.
  *
- * Memory / recent-chat are single sanitized paragraphs (not fact lists).
- * Engine context is sized for long-term + short-term notes + reply.
+ * Long-term memory is one sanitized paragraph; short-term is the raw recent message list.
  */
 object LlmPromptDefaults {
 
@@ -24,13 +23,12 @@ object LlmPromptDefaults {
     const val MAX_REPLY_WORDS = 24
     const val MAX_CHARS_PER_TURN = 120
 
-    /** Long-term memory as one paragraph. */
-    const val MAX_MEMORY_WORDS = 500
-    const val MAX_MEMORY_CHARS = 3200
+    /** Long-term memory as one paragraph (sized for ~768-token utility rewrite). */
+    const val MAX_MEMORY_WORDS = 250
+    const val MAX_MEMORY_CHARS = 1500
 
-    /** Recent chat as one sanitized paragraph (not raw turn list). */
-    const val MAX_SHORT_TERM_WORDS = 200
-    const val MAX_SHORT_TERM_CHARS = 1300
+    /** Keep the last N chat messages as short-term history (full text, not summarized). */
+    const val MAX_SHORT_TERM_MESSAGES = 8
 
     const val DIDNT_CATCH_REPLY = "Sorry, I didn't catch that."
     const val GREETING_FALLBACK = "Hey — good to see you. What's on your mind?"
@@ -43,7 +41,7 @@ object LlmPromptDefaults {
     const val SAMPLER_TEMPERATURE = 0.65
     const val MAX_OUTPUT_TOKENS = 72
 
-    /** Utility tasks (memory / short-term consolidate) — cooler, longer output. */
+    /** Utility tasks (long-term memory consolidate) — cooler sampler. */
     const val UTILITY_TOP_K = 20
     const val UTILITY_TOP_P = 0.85
     const val UTILITY_TEMPERATURE = 0.3
@@ -53,23 +51,16 @@ object LlmPromptDefaults {
         petName: String,
         personality: String,
         memoryParagraph: String,
-        shortTermParagraph: String = "",
     ): String {
         val name = petName.trim().ifEmpty { "Mochi" }
         val vibe = personality.trim().ifEmpty { DEFAULT_PERSONALITY }.take(220)
         val memory = clampMemoryParagraph(memoryParagraph)
-        val recent = clampShortTermParagraph(shortTermParagraph)
         return buildString {
             append("You are $name, an intelligent companion creature — not a dumb pet, not a chatbot. ")
             append("Personality: $vibe ")
             if (memory.isNotBlank()) {
                 append("What you remember about your friend: ")
                 append(memory)
-                append(' ')
-            }
-            if (recent.isNotBlank()) {
-                append("Recent conversation: ")
-                append(recent)
                 append(' ')
             }
             append("Answer thoughtfully in one or two short sentences. ")
@@ -80,10 +71,144 @@ object LlmPromptDefaults {
     }
 
     fun clampMemoryParagraph(text: String): String =
-        clampParagraph(text, MAX_MEMORY_WORDS, MAX_MEMORY_CHARS)
+        clampParagraph(sanitizeMemoryParagraph(text), MAX_MEMORY_WORDS, MAX_MEMORY_CHARS)
 
-    fun clampShortTermParagraph(text: String): String =
-        clampParagraph(text, MAX_SHORT_TERM_WORDS, MAX_SHORT_TERM_CHARS)
+    /**
+     * True when the friend likely stated something durable about themselves.
+     * False for definitions, trivia, greetings — those make the model "explain" into memory.
+     */
+    fun looksLikeMemorableUserTurn(text: String): Boolean {
+        val t = text.trim()
+        if (t.length < 4) return false
+        val lower = t.lowercase()
+        if (isCannedFallback(t)) return false
+        if (TRIVIAL_MEMORY_SKIP.any { lower == it || lower.startsWith("$it ") }) return false
+        if (lower.startsWith("what is") || lower.startsWith("what's") ||
+            lower.startsWith("whats ") || lower.startsWith("who is") ||
+            lower.startsWith("how do") || lower.startsWith("how does") ||
+            lower.startsWith("why is") || lower.startsWith("why do") ||
+            lower.startsWith("explain") || lower.startsWith("define")
+        ) {
+            return false
+        }
+        // Pad so "I like…" matches at the start.
+        val padded = " $lower "
+        return PERSONAL_FACT_HINTS.any { padded.contains(it) }
+    }
+
+    /** Memory-specific sanitize: reject explanation-style dumps and repeated lines. */
+    fun sanitizeMemoryParagraph(text: String): String {
+        val base = sanitizeParagraph(text)
+        if (base.isEmpty()) return ""
+        val lower = base.lowercase()
+        if (EXPLANATION_LEAK_MARKERS.any { lower.contains(it) }) return ""
+        return dedupeMemoryParagraph(base)
+    }
+
+    /** True when two memory strings are the same after normalizing punctuation/case. */
+    fun isSameMemory(a: String, b: String): Boolean {
+        val na = normalizeMemoryKey(a)
+        val nb = normalizeMemoryKey(b)
+        if (na.isEmpty() && nb.isEmpty()) return true
+        if (na.isEmpty() || nb.isEmpty()) return false
+        return na == nb
+    }
+
+    /**
+     * Collapse "same line twice" and repeated clauses the small model often echoes
+     * when merging old memory + new fact.
+     */
+    fun dedupeMemoryParagraph(text: String): String {
+        var s = collapseWhitespace(text)
+        if (s.isEmpty()) return ""
+        s = collapseWholeRepeats(s)
+
+        val clauses = splitMemoryClauses(s)
+        if (clauses.isEmpty()) return ""
+
+        val kept = mutableListOf<String>()
+        val seen = LinkedHashSet<String>()
+        for (clause in clauses) {
+            val key = normalizeMemoryKey(clause)
+            if (key.length < 3) continue
+            if (!seen.add(key)) continue
+            // Drop a short clause already covered by a longer kept clause.
+            if (kept.any { normalizeMemoryKey(it).contains(key) && normalizeMemoryKey(it) != key }) {
+                continue
+            }
+            // Drop earlier shorter clauses that this one fully covers.
+            val toRemove = kept.filter {
+                val k = normalizeMemoryKey(it)
+                k != key && key.contains(k) && k.length >= 3
+            }
+            kept.removeAll(toRemove.toSet())
+            seen.removeAll(toRemove.map { normalizeMemoryKey(it) }.toSet())
+            kept.add(clause.trim().trimEnd('.', '!', '?', ',', ';'))
+            seen.add(key)
+        }
+        if (kept.isEmpty()) return ""
+        return collapseWhitespace(kept.joinToString(". ") + ".")
+            .trimEnd('.')
+            .let { if (it.isEmpty()) "" else "$it." }
+            .let(::collapseWhitespace)
+    }
+
+    fun normalizeMemoryKey(text: String): String {
+        val sb = StringBuilder(text.length)
+        var prevSpace = true
+        for (ch in text.lowercase()) {
+            if (ch.isLetterOrDigit()) {
+                sb.append(ch)
+                prevSpace = false
+            } else if (!prevSpace) {
+                sb.append(' ')
+                prevSpace = true
+            }
+        }
+        return sb.toString().trim()
+    }
+
+    private fun splitMemoryClauses(text: String): List<String> {
+        val out = mutableListOf<String>()
+        val cur = StringBuilder()
+        for (ch in text) {
+            cur.append(ch)
+            if (ch == '.' || ch == '!' || ch == '?' || ch == ';' || ch == '\n') {
+                val piece = collapseWhitespace(cur.toString().trimEnd('.', '!', '?', ';'))
+                if (piece.isNotEmpty()) out.add(piece)
+                cur.clear()
+            }
+        }
+        val tail = collapseWhitespace(cur.toString())
+        if (tail.isNotEmpty()) out.add(tail)
+        return out
+    }
+
+    /** If the whole paragraph is the same word-block repeated (A+A, A+A+A), keep one A. */
+    private fun collapseWholeRepeats(text: String): String {
+        var s = collapseWhitespace(text)
+        repeat(6) {
+            val words = s.split(' ').filter { it.isNotEmpty() }
+            if (words.size < 4) return s
+            var collapsed: String? = null
+            for (unitWords in (words.size / 2) downTo 2) {
+                if (words.size % unitWords != 0) continue
+                val times = words.size / unitWords
+                if (times < 2) continue
+                val unit = words.take(unitWords)
+                val ok = (1 until times).all { i ->
+                    words.subList(i * unitWords, (i + 1) * unitWords) == unit
+                }
+                if (ok) {
+                    collapsed = unit.joinToString(" ")
+                    break
+                }
+            }
+            if (collapsed == null) return s
+            s = collapsed
+        }
+        return s
+    }
 
     /**
      * Sanitize then cap a memory/chat paragraph. Empty / placeholder / junk → "".
@@ -98,14 +223,19 @@ object LlmPromptDefaults {
             s = s.replace(tag, " ", ignoreCase = true)
         }
 
-        // Leading labels: "Memory:", "Recent conversation:", etc.
+        // Strip placeholder / prompt-leak tokens anywhere (never show "(empty)" etc.).
+        for (token in STRIP_TOKENS) {
+            s = s.replace(token, " ", ignoreCase = true)
+        }
+
+        // Leading labels: "Memory:", "Was:", "Now:", etc.
         for (prefix in LABEL_PREFIXES) {
             if (s.startsWith(prefix, ignoreCase = true)) {
                 s = s.substring(prefix.length).trimStart(' ', ':').trim()
             }
         }
 
-        // Inline role labels: "Friend: ", "User: "
+        // Inline role / scaffold labels
         for (role in ROLE_LABELS) {
             s = s.replace("$role:", " ", ignoreCase = true)
             s = s.replace("$role :", " ", ignoreCase = true)
@@ -136,10 +266,8 @@ object LlmPromptDefaults {
         val letters = s.count { it.isLetterOrDigit() }
         if (letters < 3) return ""
 
-        // Drop obvious instruction / support dumps that contaminate memory.
-        if (lower.contains("here are") || lower.contains("i can help") ||
-            lower.contains("the user") || lower.contains("feel free to ask")
-        ) {
+        // Reject prompt echoes / instruction dumps — not real memory.
+        if (PROMPT_LEAK_MARKERS.any { lower.contains(it) }) {
             return ""
         }
 
@@ -175,7 +303,7 @@ object LlmPromptDefaults {
     }
 
     private fun clampParagraph(text: String, maxWords: Int, maxChars: Int): String {
-        val cleaned = sanitizeParagraph(text)
+        val cleaned = text.trim()
         if (cleaned.isEmpty()) return ""
         val words = cleaned.split(' ').filter { it.isNotEmpty() }
         val byWords = if (words.size <= maxWords) {
@@ -184,7 +312,7 @@ object LlmPromptDefaults {
             words.take(maxWords).joinToString(" ")
         }
         return byWords.take(maxChars).trimEnd(',', ';', ':', '-', '.', ' ')
-            .let { sanitizeParagraph(it) }
+            .let { sanitizeMemoryParagraph(it) }
     }
 
     fun isCannedFallback(text: String): Boolean {
@@ -198,6 +326,51 @@ object LlmPromptDefaults {
     private val EMPTY_PLACEHOLDERS = setOf(
         "none", "null", "nil", "n/a", "na", "empty", "(empty)", "[empty]",
         "nothing", "no memory", "no data", "unknown", "...", "…", "-", "--",
+        "was", "said", "now",
+    )
+
+    /** Removed wherever they appear so UI never shows scaffold junk. */
+    private val STRIP_TOKENS = listOf(
+        "(empty)", "[empty]", "{empty}",
+        "current memory:", "current recent conversation:",
+        "latest exchange:", "updated memory:", "recent conversation:",
+        "write the updated paragraph now", "drop empty/placeholder text",
+        "reply exactly: none", "or none", "else: none",
+        "invent nothing", "no labels or lists",
+        "plain paragraph", "one plain paragraph",
+    )
+
+    private val PROMPT_LEAK_MARKERS = listOf(
+        "here are", "i can help", "the user", "feel free to ask",
+        "max ${MAX_MEMORY_WORDS} words",
+        "rewrite personal facts", "rewrite what was just",
+        "latest exchange", "current memory", "drop empty",
+        "write the updated", "intelligent companion",
+        "do not invent", "if nothing worth",
+        "compress lasting facts", "copy facts briefly",
+    )
+
+    /** Reject memory that reads like a definition / lecture, not a fact note. */
+    private val EXPLANATION_LEAK_MARKERS = listOf(
+        "this means", "that means", "refers to", "is when", "is a type of",
+        "is a kind of", "in other words", "essentially", "basically means",
+        "can be defined", "is defined as", "for example", "such as a",
+        "typically", "in simple terms", "to put it simply", "it is important",
+        "you should know", "let me explain", "the concept of",
+    )
+
+    private val PERSONAL_FACT_HINTS = listOf(
+        " i ", " i'm ", " im ", " i am ", " my ", " mine ", " me ",
+        " i like ", " i love ", " i hate ", " i prefer ", " i want ",
+        " i live ", " i work ", " i study ", " i have ", " i had ",
+        " my name ", " call me ", " i'm called ", " i am called ",
+        " my friend ", " my mom ", " my dad ", " my wife ", " my husband ",
+        " my dog ", " my cat ", " my job ", " my school ",
+    )
+
+    private val TRIVIAL_MEMORY_SKIP = listOf(
+        "hi", "hello", "hey", "yo", "thanks", "thank you", "ok", "okay",
+        "bye", "good night", "good morning", "good evening",
     )
 
     private val EMOTION_TAGS = listOf(
@@ -207,7 +380,8 @@ object LlmPromptDefaults {
 
     private val LABEL_PREFIXES = listOf(
         "updated memory:", "recent conversation:", "short-term:", "short term:",
-        "memory:", "output:", "note:", "summary:",
+        "current memory:", "memory:", "output:", "note:", "summary:",
+        "was:", "said:", "now:", "short:",
     )
 
     private val ROLE_LABELS = listOf(

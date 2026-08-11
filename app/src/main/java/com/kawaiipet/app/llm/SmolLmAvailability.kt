@@ -87,7 +87,7 @@ class SmolLmAvailability @Inject constructor(
 
     companion object {
         private const val TAG = "SmolLmAvailability"
-        // Fits long-term (500w) + short-term (200w) notes + system + reply.
-        private const val MAX_NUM_TOKENS = 4096
+        // Fits memory + short-term notes + system + reply.
+        private const val MAX_NUM_TOKENS = 2048
     }
 }

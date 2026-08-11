@@ -30,7 +30,6 @@ class ConversationManager @Inject constructor(
             val rawResponse = llmService.chat(
                 messages = messages,
                 memoryParagraph = "",
-                shortTermParagraph = "",
                 onPartial = onPartial,
             )
             val (cleanText, expression) = parseEmotionTag(rawResponse)
@@ -43,21 +42,20 @@ class ConversationManager @Inject constructor(
             return LlmResponse(spoken, expression)
         }
 
-        val messages = listOf(ChatMessage(Role.USER, text))
+        shortTermMemory.addMessage(ChatMessage(Role.USER, text))
+        val messages = shortTermMemory.getMessages()
         val memoryParagraph = memoryPipeline.getMemoryParagraph()
-        val shortTermParagraph = shortTermMemory.getParagraph()
 
         var rawResponse = llmService.chat(
             messages = messages,
             memoryParagraph = memoryParagraph,
-            shortTermParagraph = shortTermParagraph,
             onPartial = onPartial,
         )
         Log.d(TAG, "llm raw (${rawResponse.length} chars): ${rawResponse.toOneLineLog()}")
 
-        // If it regurgitates a canned line, retry once without recent-chat context.
+        // If it regurgitates a canned line, retry once without history.
         if (isStuckOnCanned(rawResponse)) {
-            Log.w(TAG, "Model stuck on canned line — retrying once without short-term")
+            Log.w(TAG, "Model stuck on canned line — retrying once without history")
             val nudged = listOf(
                 ChatMessage(
                     Role.USER,
@@ -67,7 +65,6 @@ class ConversationManager @Inject constructor(
             rawResponse = llmService.chat(
                 messages = nudged,
                 memoryParagraph = memoryParagraph,
-                shortTermParagraph = "",
             )
             Log.d(TAG, "llm retry (${rawResponse.length} chars): ${rawResponse.toOneLineLog()}")
         }
@@ -87,10 +84,13 @@ class ConversationManager @Inject constructor(
                 "spoken=${spokenText.toOneLineLog()}",
         )
 
-        // Never fold canned/failed lines into short-term — they train the next copy loop.
-        if (!LlmPromptDefaults.isCannedFallback(spokenText)) {
-            shortTermMemory.scheduleConsolidate(text, spokenText)
-            memoryPipeline.scheduleConsolidate(text, spokenText)
+        // Never store canned/failed lines — they train the next copy loop.
+        if (LlmPromptDefaults.isCannedFallback(spokenText)) {
+            shortTermMemory.removeLastUserMessage()
+        } else {
+            shortTermMemory.addMessage(ChatMessage(Role.ASSISTANT, spokenText))
+            // Defer long-term summarize until Home (session flush) — keep chat snappy.
+            memoryPipeline.recordTurn(text, spokenText)
         }
 
         return LlmResponse(spokenText, expression)

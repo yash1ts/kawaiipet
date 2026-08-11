@@ -103,8 +103,7 @@ fun MemoryScreen(
                 verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {
                 Text(
-                    "One short paragraph (max ${LlmPromptDefaults.MAX_MEMORY_WORDS} words) " +
-                        "kept for SmolLM’s small context.",
+                    "What your pet remembers about you.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -115,7 +114,7 @@ fun MemoryScreen(
                     ),
                 ) {
                     Text(
-                        text = memory,
+                        text = LlmPromptDefaults.clampMemoryParagraph(memory),
                         style = MaterialTheme.typography.bodyLarge,
                         modifier = Modifier.padding(16.dp),
                     )

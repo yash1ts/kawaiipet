@@ -2,34 +2,23 @@ package com.kawaiipet.app.llm
 
 interface LlmService {
     /**
-     * Chat as the pet. [memoryParagraph] / [shortTermParagraph] are capped notes in the system
-     * prompt (long-term facts vs recent chat). [onPartial] gets streamed raw tokens.
+     * Chat as the pet. [messages] is short-term history ending with the latest user turn.
+     * [memoryParagraph] is the long-term note injected into the system prompt.
+     * [onPartial] gets streamed raw tokens.
      */
     suspend fun chat(
         messages: List<ChatMessage>,
         memoryParagraph: String = "",
-        shortTermParagraph: String = "",
         onPartial: (String) -> Unit = {},
     ): String
 
     /**
-     * Separate utility call (no pet persona / no chat history): rewrite memory as one short
-     * sanitized paragraph. Returns empty string if nothing useful should be kept (`NONE`).
+     * One-shot utility: merge [friendLines] from a finished chat session into [currentMemory].
+     * Returns empty string if nothing useful should be kept (`NONE`).
      */
-    suspend fun consolidateMemory(
+    suspend fun consolidateSession(
         currentMemory: String,
-        userText: String,
-        assistantText: String,
-    ): String
-
-    /**
-     * Same utility style as [consolidateMemory], but for recent conversation continuity
-     * (topics just discussed), not stable biography.
-     */
-    suspend fun consolidateShortTerm(
-        currentShortTerm: String,
-        userText: String,
-        assistantText: String,
+        friendLines: List<String>,
     ): String
 
     /** Best-effort model warmup so the first [chat] of a session doesn't pay init cost. */

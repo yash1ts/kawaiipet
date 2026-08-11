@@ -168,10 +168,15 @@ fun HomeScreen(
     }
 
     val lifecycleOwner = LocalLifecycleOwner.current
+    // Summarize the last pet session into long-term memory when Home is shown.
+    LaunchedEffect(Unit) {
+        homeViewModel.flushSessionMemory()
+    }
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
                 refreshPermissions()
+                homeViewModel.flushSessionMemory()
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
