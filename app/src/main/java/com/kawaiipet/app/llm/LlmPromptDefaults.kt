@@ -3,7 +3,7 @@ package com.kawaiipet.app.llm
 /**
  * Prompt + sampler defaults for on-device SmolLM2-135M-Instruct via LiteRT-LM.
  *
- * Long-term memory is one sanitized paragraph; short-term is the raw recent message list.
+ * Long-term memory is RAG-retrieved chunks (prompt-sized); short-term is recent messages.
  */
 object LlmPromptDefaults {
 
@@ -23,9 +23,13 @@ object LlmPromptDefaults {
     const val MAX_REPLY_WORDS = 24
     const val MAX_CHARS_PER_TURN = 120
 
-    /** Long-term memory as one paragraph (sized for ~768-token utility rewrite). */
+    /** Legacy paragraph prefs / migration clamp only — storage itself is uncapped in RAG. */
     const val MAX_MEMORY_WORDS = 250
     const val MAX_MEMORY_CHARS = 1500
+
+    /** Cap only what is injected into SmolLM's system prompt from retrieved chunks. */
+    const val MAX_RETRIEVED_MEMORY_WORDS = 120
+    const val MAX_RETRIEVED_MEMORY_CHARS = 600
 
     /** Keep the last N chat messages as short-term history (full text, not summarized). */
     const val MAX_SHORT_TERM_MESSAGES = 8
@@ -41,12 +45,6 @@ object LlmPromptDefaults {
     const val SAMPLER_TEMPERATURE = 0.65
     const val MAX_OUTPUT_TOKENS = 72
 
-    /** Utility tasks (long-term memory consolidate) — cooler sampler. */
-    const val UTILITY_TOP_K = 20
-    const val UTILITY_TOP_P = 0.85
-    const val UTILITY_TEMPERATURE = 0.3
-    const val UTILITY_MAX_OUTPUT_TOKENS = 768
-
     fun buildSystemPrompt(
         petName: String,
         personality: String,
@@ -54,17 +52,19 @@ object LlmPromptDefaults {
     ): String {
         val name = petName.trim().ifEmpty { "Mochi" }
         val vibe = personality.trim().ifEmpty { DEFAULT_PERSONALITY }.take(220)
-        val memory = clampMemoryParagraph(memoryParagraph)
+        val memory = clampRetrievedMemory(memoryParagraph)
         return buildString {
             append("You are $name, an intelligent companion creature — not a dumb pet, not a chatbot. ")
             append("Personality: $vibe ")
             if (memory.isNotBlank()) {
-                append("What you remember about your friend: ")
+                append("Known facts about your friend (third person only; never speak as them): ")
                 append(memory)
                 append(' ')
             }
             append("Answer thoughtfully in one or two short sentences. ")
             append("Be clear and smart; if they ask what something is, give a real explanation. ")
+            append("Never repeat their words back — reply with your own thought. ")
+            append("Never say you are dumb, not smart, or a cookie. ")
             append("Stay warm and witty. Never baby-talk. Never act like customer support. ")
             append("End with [happy] or [thinking].")
         }
@@ -72,6 +72,10 @@ object LlmPromptDefaults {
 
     fun clampMemoryParagraph(text: String): String =
         clampParagraph(sanitizeMemoryParagraph(text), MAX_MEMORY_WORDS, MAX_MEMORY_CHARS)
+
+    /** Prompt-injection clamp for RAG-retrieved memory (not a storage limit). */
+    fun clampRetrievedMemory(text: String): String =
+        clampParagraph(sanitizeMemoryParagraph(text), MAX_RETRIEVED_MEMORY_WORDS, MAX_RETRIEVED_MEMORY_CHARS)
 
     /**
      * True when the friend likely stated something durable about themselves.

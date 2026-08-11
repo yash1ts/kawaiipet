@@ -153,6 +153,8 @@ class AudioPipeline(
         var noiseFloor = 0.006f
         var noiseSamples = 0
         val recordingStartedAt = SystemClock.elapsedRealtime()
+        // Keep a short pre-roll so ASR still hears word onsets after VAD trips.
+        val preRoll = ArrayDeque<FloatArray>(PRE_SPEECH_LOOKBACK_CHUNKS + 1)
 
         recordJob = scope.launch {
             recorder.readLoop { samples ->
@@ -166,7 +168,6 @@ class AudioPipeline(
                 // VAD on speech-band energy (no AGC). Feed leveled audio to the model.
                 val energy = sttInputCleaner.speechBandRms(samples)
                 val floatSamples = sttInputCleaner.cleanPcm16ToFloat(samples)
-                stt.acceptWaveform(floatSamples)
 
                 if (hasSpeechHint && stt.isEndpoint()) {
                     finishListen(result)
@@ -198,6 +199,11 @@ class AudioPipeline(
                     if (!hasSpeechHint && speechFrameCount >= MIN_SPEECH_FRAMES) {
                         hasSpeechHint = true
                         speechHintStartedAt = now
+                        // Flush lookback + current chunk so Moonshine isn't starved of onsets.
+                        while (preRoll.isNotEmpty()) {
+                            stt.acceptWaveform(preRoll.removeFirst())
+                        }
+                        stt.acceptWaveform(floatSamples)
                         Log.d(
                             TAG,
                             "Sherpa: speech start e=%.4f gate=%.4f noise=%.4f snr=%.2f".format(
@@ -207,6 +213,10 @@ class AudioPipeline(
                                 snr,
                             ),
                         )
+                    } else if (hasSpeechHint) {
+                        stt.acceptWaveform(floatSamples)
+                    } else {
+                        pushPreRoll(preRoll, floatSamples)
                     }
                     if (hasSpeechHint) speechChunksTotal++
                 } else {
@@ -214,6 +224,7 @@ class AudioPipeline(
                     // Decay peak so a loud first word doesn't freeze a high end threshold.
                     speechPeak *= 0.90f
                     if (!hasSpeechHint) {
+                        pushPreRoll(preRoll, floatSamples)
                         leadingSilenceChunks++
                         if (leadingSilenceChunks > LEADING_SILENCE_CHUNKS) {
                             Log.d(
@@ -228,6 +239,7 @@ class AudioPipeline(
                             return@readLoop
                         }
                     } else {
+                        stt.acceptWaveform(floatSamples)
                         val endFloor = endOfSpeechFloor(noiseFloor, speechPeak, speechLevel)
                         if (energy <= endFloor && speechChunksTotal >= MIN_SPEECH_CHUNKS_BEFORE_END) {
                             silenceCount++
@@ -267,16 +279,30 @@ class AudioPipeline(
         val awaited = withTimeoutOrNull(timeoutMs) { result.await() }
         recorder.stop()
         recordJob?.cancelAndJoin()
-        val text = awaited ?: stt.getFinalResult()
+        val text = awaited ?: finalizeSherpaTranscript()
 
         stt.endStream()
         return text.trim()
     }
 
+    private fun pushPreRoll(preRoll: ArrayDeque<FloatArray>, chunk: FloatArray) {
+        preRoll.addLast(chunk)
+        while (preRoll.size > PRE_SPEECH_LOOKBACK_CHUNKS) {
+            preRoll.removeFirst()
+        }
+    }
+
+    /** Pad a short silence tail, then decode — offline ASR often drops final phones without it. */
+    private fun finalizeSherpaTranscript(): String {
+        val pad = FloatArray(TRAILING_PAD_SAMPLES)
+        stt.acceptWaveform(pad)
+        return stt.getFinalResult()
+    }
+
     private fun finishListen(result: CompletableDeferred<String>) {
         if (result.isCompleted) return
         recorder.stop()
-        result.complete(stt.getFinalResult())
+        result.complete(finalizeSherpaTranscript())
     }
 
     private suspend fun listenWithPlatformSpeechRecognizer(
@@ -590,31 +616,37 @@ class AudioPipeline(
         private const val NOISE_CALIBRATION_CHUNKS = 10
 
         /** Absolute margin above noise floor to count as speech. */
-        private const val SPEECH_MARGIN = 0.004f
-        private const val MIN_SPEECH_GATE = 0.006f
+        private const val SPEECH_MARGIN = 0.0032f
+        private const val MIN_SPEECH_GATE = 0.005f
 
         /**
          * Relative SNR: (energy - noise) / noise. Lets quiet speech win in a quiet room
          * and still reject steady background noise.
          */
-        private const val SPEECH_SNR = 1.35f
+        private const val SPEECH_SNR = 1.25f
 
         /** End-of-speech: just above ambient, relative to recent speech level. */
-        private const val END_MARGIN = 0.0025f
-        private const val MIN_END_FLOOR = 0.0035f
-        private const val SPEECH_END_RATIO = 0.42f
-        private const val SPEECH_LEVEL_END_RATIO = 0.50f
+        private const val END_MARGIN = 0.0022f
+        private const val MIN_END_FLOOR = 0.003f
+        private const val SPEECH_END_RATIO = 0.38f
+        private const val SPEECH_LEVEL_END_RATIO = 0.46f
         /** Cap so loud first syllables don't lock a high end threshold. */
         private const val MAX_END_ABOVE_NOISE = 0.018f
 
         /** Need this many speech chunks before we treat it as real speech (~200ms). */
         private const val MIN_SPEECH_FRAMES = 2
 
-        /** Don't cut off until we've heard ~300ms of voiced audio. */
-        private const val MIN_SPEECH_CHUNKS_BEFORE_END = 3
+        /** Don't cut off until we've heard ~400ms of voiced audio. */
+        private const val MIN_SPEECH_CHUNKS_BEFORE_END = 4
 
-        /** ~100ms per chunk — 10 ≈ 1.0s trailing silence. */
-        private const val SILENCE_CHUNKS_AFTER_SPEECH = 10
+        /** ~100ms per chunk — 16 ≈ 1.6s trailing silence (was 1.0s; clipped mid-thought). */
+        private const val SILENCE_CHUNKS_AFTER_SPEECH = 16
+
+        /** Keep ~300ms before VAD speech-start so first phonemes aren't clipped for offline ASR. */
+        private const val PRE_SPEECH_LOOKBACK_CHUNKS = 3
+
+        /** ~250ms of zeros appended before offline decode. */
+        private const val TRAILING_PAD_SAMPLES = SttEngineConfig.SAMPLE_RATE / 4
 
         /** ~100ms per chunk — 100 ≈ 10s with no voiced audio. */
         private const val LEADING_SILENCE_CHUNKS = 100

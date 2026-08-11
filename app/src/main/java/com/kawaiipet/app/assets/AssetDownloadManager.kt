@@ -135,6 +135,13 @@ class AssetDownloadManager @Inject constructor(
             is AssetKind.RawFile -> {
                 File(modelManager.getModelDir(spec.id), kind.fileName).isFile
             }
+            is AssetKind.FileBundle -> {
+                val dir = modelManager.getModelDir(spec.id)
+                kind.files.all { f ->
+                    val file = File(dir, f.fileName)
+                    file.isFile && file.length() > 0L
+                }
+            }
             AssetKind.TarBz2 -> true
         }
     }
@@ -143,40 +150,14 @@ class AssetDownloadManager @Inject constructor(
         withContext(Dispatchers.IO) {
             val destDir = modelManager.getModelDir(spec.id)
             destDir.mkdirs()
-            val tmp = File(context.cacheDir, "dl-${spec.id}.partial")
-            if (tmp.exists()) tmp.delete()
-
-            Log.i(TAG, "Downloading ${spec.id} from ${spec.url}")
-            downloadToFile(spec, tmp, index, count) { bytes, totalBytes ->
-                val perAsset = if (totalBytes != null && totalBytes > 0) {
-                    (bytes.toFloat() / totalBytes.toFloat()).coerceIn(0f, 1f)
-                } else {
-                    0f
-                }
-                val overall = (index + perAsset * 0.92f) / count.toFloat()
-                _state.value = AssetDownloadState.Downloading(
-                    assetName = spec.displayName,
-                    assetIndex = index,
-                    assetCount = count,
-                    bytesDownloaded = bytes,
-                    totalBytes = totalBytes,
-                    overallFraction = overall,
-                    completedIds = completedIds(),
-                    currentId = spec.id,
-                )
-            }
-
-            _state.value = AssetDownloadState.Installing(
-                assetName = spec.displayName,
-                assetIndex = index,
-                assetCount = count,
-                overallFraction = (index + 0.95f) / count.toFloat(),
-                completedIds = completedIds(),
-                currentId = spec.id,
-            )
 
             when (val kind = spec.kind) {
                 is AssetKind.RawFile -> {
+                    val tmp = File(context.cacheDir, "dl-${spec.id}.partial")
+                    if (tmp.exists()) tmp.delete()
+                    Log.i(TAG, "Downloading ${spec.id} from ${spec.url}")
+                    downloadUrlToFile(spec.url, spec.displayName, tmp, index, count, spec.id)
+                    emitInstalling(spec, index, count)
                     destDir.deleteRecursively()
                     destDir.mkdirs()
                     val out = File(destDir, kind.fileName)
@@ -186,7 +167,44 @@ class AssetDownloadManager @Inject constructor(
                     }
                     modelManager.markModelOk(spec.id)
                 }
+                is AssetKind.FileBundle -> {
+                    destDir.mkdirs()
+                    val fileCount = kind.files.size.coerceAtLeast(1)
+                    kind.files.forEachIndexed { fileIndex, bundled ->
+                        val out = File(destDir, bundled.fileName)
+                        if (out.isFile && out.length() > 0L) return@forEachIndexed
+                        val tmp = File(context.cacheDir, "dl-${spec.id}-$fileIndex.partial")
+                        if (tmp.exists()) tmp.delete()
+                        Log.i(TAG, "Downloading ${spec.id}/${bundled.fileName} from ${bundled.url}")
+                        val bundleProgressIndex = index
+                        // Weight progress across files inside the bundle.
+                        downloadUrlToFile(
+                            url = bundled.url,
+                            displayName = "${spec.displayName} (${bundled.fileName})",
+                            dest = tmp,
+                            index = bundleProgressIndex,
+                            count = count,
+                            currentId = spec.id,
+                            progressBias = fileIndex.toFloat() / fileCount,
+                            progressSpan = 0.92f / fileCount,
+                        )
+                        if (!tmp.renameTo(out)) {
+                            tmp.copyTo(out, overwrite = true)
+                            tmp.delete()
+                        }
+                    }
+                    emitInstalling(spec, index, count)
+                    if (!kind.files.all { File(destDir, it.fileName).isFile }) {
+                        error("Could not install ${spec.displayName}. Please retry.")
+                    }
+                    modelManager.markModelOk(spec.id)
+                }
                 AssetKind.TarBz2 -> {
+                    val tmp = File(context.cacheDir, "dl-${spec.id}.partial")
+                    if (tmp.exists()) tmp.delete()
+                    Log.i(TAG, "Downloading ${spec.id} from ${spec.url}")
+                    downloadUrlToFile(spec.url, spec.displayName, tmp, index, count, spec.id)
+                    emitInstalling(spec, index, count)
                     val modelsRoot = File(context.filesDir, "models").also { it.mkdirs() }
                     destDir.deleteRecursively()
                     extractTarBz2(tmp, modelsRoot)
@@ -205,14 +223,28 @@ class AssetDownloadManager @Inject constructor(
             Log.i(TAG, "Installed asset ${spec.id}")
         }
 
-    private fun downloadToFile(
-        spec: AssetSpec,
+    private fun emitInstalling(spec: AssetSpec, index: Int, count: Int) {
+        _state.value = AssetDownloadState.Installing(
+            assetName = spec.displayName,
+            assetIndex = index,
+            assetCount = count,
+            overallFraction = (index + 0.95f) / count.toFloat(),
+            completedIds = completedIds(),
+            currentId = spec.id,
+        )
+    }
+
+    private fun downloadUrlToFile(
+        url: String,
+        displayName: String,
         dest: File,
         index: Int,
         count: Int,
-        onProgress: (bytes: Long, total: Long?) -> Unit,
+        currentId: String,
+        progressBias: Float = 0f,
+        progressSpan: Float = 0.92f,
     ) {
-        val connection = (URL(spec.url).openConnection() as HttpURLConnection).apply {
+        val connection = (URL(url).openConnection() as HttpURLConnection).apply {
             instanceFollowRedirects = true
             connectTimeout = 30_000
             readTimeout = 120_000
@@ -223,7 +255,7 @@ class AssetDownloadManager @Inject constructor(
             connection.connect()
             val code = connection.responseCode
             if (code !in 200..299) {
-                error("Could not download ${spec.displayName} (error $code). Check your connection.")
+                error("Could not download $displayName (error $code). Check your connection.")
             }
             val total = connection.contentLengthLong.takeIf { it > 0 }
             BufferedInputStream(connection.inputStream).use { input ->
@@ -231,6 +263,25 @@ class AssetDownloadManager @Inject constructor(
                     val buf = ByteArray(64 * 1024)
                     var readTotal = 0L
                     var lastEmit = 0L
+                    fun emit(bytes: Long, totalBytes: Long?) {
+                        val perFile = if (totalBytes != null && totalBytes > 0) {
+                            (bytes.toFloat() / totalBytes.toFloat()).coerceIn(0f, 1f)
+                        } else {
+                            0f
+                        }
+                        val overall =
+                            (index + progressBias + perFile * progressSpan) / count.toFloat()
+                        _state.value = AssetDownloadState.Downloading(
+                            assetName = displayName,
+                            assetIndex = index,
+                            assetCount = count,
+                            bytesDownloaded = bytes,
+                            totalBytes = totalBytes,
+                            overallFraction = overall,
+                            completedIds = completedIds(),
+                            currentId = currentId,
+                        )
+                    }
                     while (true) {
                         val n = input.read(buf)
                         if (n < 0) break
@@ -238,22 +289,12 @@ class AssetDownloadManager @Inject constructor(
                         readTotal += n
                         if (readTotal - lastEmit >= 256 * 1024 || total != null && readTotal == total) {
                             lastEmit = readTotal
-                            onProgress(readTotal, total)
+                            emit(readTotal, total)
                         }
                     }
-                    onProgress(readTotal, total ?: readTotal)
+                    emit(readTotal, total ?: readTotal)
                 }
             }
-            _state.value = AssetDownloadState.Downloading(
-                assetName = spec.displayName,
-                assetIndex = index,
-                assetCount = count,
-                bytesDownloaded = dest.length(),
-                totalBytes = dest.length(),
-                overallFraction = (index + 0.92f) / count.toFloat(),
-                completedIds = completedIds(),
-                currentId = spec.id,
-            )
         } finally {
             connection.disconnect()
         }

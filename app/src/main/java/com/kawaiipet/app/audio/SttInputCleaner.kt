@@ -91,7 +91,7 @@ class SttInputCleaner(
         for (v in tmp) sumSq += (v * v).toDouble()
         val rms = sqrt(sumSq / n).toFloat()
 
-        val targetRms = 0.07f
+        val targetRms = 0.08f
         val rawGain = if (rms > 1e-5f) (targetRms / rms).coerceIn(MIN_GAIN, MAX_GAIN) else 1f
         smoothedGain = SMOOTH * smoothedGain + (1f - SMOOTH) * rawGain
 
@@ -104,7 +104,7 @@ class SttInputCleaner(
     companion object {
         private const val MIN_GAIN = 0.7f
         /** Allow more boost for quiet speech (VAD still uses ungained speech-band RMS). */
-        private const val MAX_GAIN = 3.5f
-        private const val SMOOTH = 0.90f
+        private const val MAX_GAIN = 4.0f
+        private const val SMOOTH = 0.88f
     }
 }

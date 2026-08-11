@@ -44,11 +44,11 @@ class ConversationManager @Inject constructor(
 
         shortTermMemory.addMessage(ChatMessage(Role.USER, text))
         val messages = shortTermMemory.getMessages()
-        val memoryParagraph = memoryPipeline.getMemoryParagraph()
+        val memoryContext = memoryPipeline.retrieveForChat(text)
 
         var rawResponse = llmService.chat(
             messages = messages,
-            memoryParagraph = memoryParagraph,
+            memoryParagraph = memoryContext,
             onPartial = onPartial,
         )
         Log.d(TAG, "llm raw (${rawResponse.length} chars): ${rawResponse.toOneLineLog()}")
@@ -64,7 +64,7 @@ class ConversationManager @Inject constructor(
             )
             rawResponse = llmService.chat(
                 messages = nudged,
-                memoryParagraph = memoryParagraph,
+                memoryParagraph = memoryContext,
             )
             Log.d(TAG, "llm retry (${rawResponse.length} chars): ${rawResponse.toOneLineLog()}")
         }
@@ -89,8 +89,8 @@ class ConversationManager @Inject constructor(
             shortTermMemory.removeLastUserMessage()
         } else {
             shortTermMemory.addMessage(ChatMessage(Role.ASSISTANT, spokenText))
-            // Defer long-term summarize until Home (session flush) — keep chat snappy.
-            memoryPipeline.recordTurn(text, spokenText)
+            // Index memorable facts on background IO — do not block the reply path.
+            memoryPipeline.scheduleIndexTurn(text, spokenText)
         }
 
         return LlmResponse(spokenText, expression)
@@ -134,16 +134,62 @@ class ConversationManager @Inject constructor(
             return ""
         }
         if (isNarration(cleaned) || isMetaInstruction(cleaned) || isAssistantDump(cleaned) ||
-            isAssistantDump(text) || isStuckOnCanned(cleaned)
+            isAssistantDump(text) || isStuckOnCanned(cleaned) || isSelfDeprecatingPet(cleaned)
         ) {
             Log.w(TAG, "Rejected bad reply: ${cleaned.take(80)}")
             return ""
         }
-        if (normalizeForCompare(cleaned) == normalizeForCompare(userText)) {
-            Log.w(TAG, "Rejected pure user echo")
+        if (isUserEcho(cleaned, userText)) {
+            Log.w(TAG, "Rejected user echo: ${cleaned.take(80)}")
             return ""
         }
         return cleaned
+    }
+
+    /**
+     * Tiny models derail on words like "cookie" into idioms ("I'm not a smart cookie")
+     * that fight the clever-companion persona.
+     */
+    private fun isSelfDeprecatingPet(text: String): Boolean {
+        val lower = text.lowercase()
+        return listOf(
+            "smart cookie",
+            "not a smart",
+            "i'm not smart",
+            "im not smart",
+            "i am not smart",
+            "i'm dumb",
+            "im dumb",
+            "i am dumb",
+            "not very smart",
+            "just a dumb",
+            "dumb pet",
+            "i'm not clever",
+            "im not clever",
+            "i'm not very clever",
+        ).any { lower.contains(it) }
+    }
+
+    /** Exact or near-verbatim repeat of what the friend just said. */
+    private fun isUserEcho(reply: String, userText: String): Boolean {
+        val r = normalizeForCompare(reply)
+        val u = normalizeForCompare(userText)
+        if (r.isEmpty() || u.isEmpty()) return false
+        if (r == u) return true
+        // Reply is just the user line with a tiny tag/prefix stripped or added.
+        if (r.length >= 4 && (u.contains(r) || r.contains(u))) {
+            val shorter = minOf(r.length, u.length).toFloat()
+            val longer = maxOf(r.length, u.length).toFloat()
+            if (shorter / longer >= 0.85f) return true
+        }
+        val rTokens = r.split(' ').filter { it.length > 1 }.toSet()
+        val uTokens = u.split(' ').filter { it.length > 1 }.toSet()
+        if (rTokens.size >= 3 && uTokens.size >= 3) {
+            val overlap = rTokens.intersect(uTokens).size.toFloat()
+            val union = rTokens.union(uTokens).size.toFloat().coerceAtLeast(1f)
+            if (overlap / union >= 0.85f) return true
+        }
+        return false
     }
 
     private fun extractSpokenCore(raw: String, lastUser: String): String {

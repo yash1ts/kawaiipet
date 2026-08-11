@@ -31,21 +31,33 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.navigation.NavController
-import com.kawaiipet.app.llm.LlmPromptDefaults
 import com.kawaiipet.app.memory.MemoryPipeline
+import com.kawaiipet.app.memory.rag.RagMemoryStore
 import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import javax.inject.Inject
 
 @HiltViewModel
 class MemoryViewModel @Inject constructor(
     private val memoryPipeline: MemoryPipeline,
+    private val ragMemoryStore: RagMemoryStore,
 ) : ViewModel() {
 
-    val memoryParagraph = memoryPipeline.memoryParagraph
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), "")
+    val memoryChunks = memoryPipeline.memoryChunks
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    init {
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) {
+                ragMemoryStore.ensureReady()
+                ragMemoryStore.refreshCatalog()
+            }
+        }
+    }
 
     fun clearMemory() {
         viewModelScope.launch { memoryPipeline.clearMemory() }
@@ -58,7 +70,7 @@ fun MemoryScreen(
     navController: NavController,
     viewModel: MemoryViewModel = hiltViewModel(),
 ) {
-    val memory by viewModel.memoryParagraph.collectAsState()
+    val chunks by viewModel.memoryChunks.collectAsState()
 
     Scaffold(
         topBar = {
@@ -70,7 +82,7 @@ fun MemoryScreen(
                     }
                 },
                 actions = {
-                    if (memory.isNotBlank()) {
+                    if (chunks.isNotEmpty()) {
                         IconButton(onClick = { viewModel.clearMemory() }) {
                             Icon(Icons.Default.Delete, contentDescription = "Clear memory")
                         }
@@ -79,7 +91,7 @@ fun MemoryScreen(
             )
         },
     ) { padding ->
-        if (memory.isBlank()) {
+        if (chunks.isEmpty()) {
             Box(
                 modifier = Modifier
                     .fillMaxSize()
@@ -87,7 +99,7 @@ fun MemoryScreen(
                 contentAlignment = Alignment.Center,
             ) {
                 Text(
-                    "No memory yet. Chat with your pet and it will keep a short note.",
+                    "No memory yet. Chat with your pet and it will remember important things about you.",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(24.dp),
@@ -103,21 +115,23 @@ fun MemoryScreen(
                 verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {
                 Text(
-                    "What your pet remembers about you.",
+                    "What your pet remembers about you (${chunks.size}).",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    colors = CardDefaults.cardColors(
-                        containerColor = MaterialTheme.colorScheme.surfaceVariant,
-                    ),
-                ) {
-                    Text(
-                        text = LlmPromptDefaults.clampMemoryParagraph(memory),
-                        style = MaterialTheme.typography.bodyLarge,
-                        modifier = Modifier.padding(16.dp),
-                    )
+                chunks.asReversed().forEach { chunk ->
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = CardDefaults.cardColors(
+                            containerColor = MaterialTheme.colorScheme.surfaceVariant,
+                        ),
+                    ) {
+                        Text(
+                            text = chunk,
+                            style = MaterialTheme.typography.bodyLarge,
+                            modifier = Modifier.padding(16.dp),
+                        )
+                    }
                 }
                 Button(
                     onClick = { viewModel.clearMemory() },

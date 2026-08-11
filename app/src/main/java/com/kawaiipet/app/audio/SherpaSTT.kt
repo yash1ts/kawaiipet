@@ -147,7 +147,8 @@ class SherpaSTT(private val modelManager: ModelManager) {
             hotwordsScore = 1.5f
             ruleFsts = ""
             ruleFars = ""
-            blankPenalty = 0f
+            // Mild blank penalty reduces dropped short words / trailing cutoffs on CTC/Moonshine.
+            blankPenalty = SttEngineConfig.OFFLINE_BLANK_PENALTY
         }
         return try {
             offlineRecognizer = OfflineRecognizer(assetManager = null, config = config)

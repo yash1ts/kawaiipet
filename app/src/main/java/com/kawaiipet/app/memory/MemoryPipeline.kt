@@ -2,97 +2,193 @@ package com.kawaiipet.app.memory
 
 import android.util.Log
 import com.kawaiipet.app.llm.LlmPromptDefaults
-import com.kawaiipet.app.llm.LlmService
+import com.kawaiipet.app.memory.rag.RagMemoryStore
 import com.kawaiipet.app.util.PreferenceManager
+import java.util.ArrayDeque
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 
 /**
- * Long-term pet memory. Chat turns are recorded into [SessionTranscript] during a session;
- * they are summarized into prefs once (e.g. when Home opens) — not after every reply.
+ * Long-term pet memory via on-device RAG (MiniLM + SqliteVectorStore).
+ *
+ * Indexing always runs on a background IO scope after app start — never blocks chat/UI.
+ * Retrieval is gated so greetings skip and casual chat only rarely pulls LTM.
  */
 @Singleton
 class MemoryPipeline @Inject constructor(
-    private val llmService: LlmService,
+    private val ragMemoryStore: RagMemoryStore,
+    private val retrievalGate: MemoryRetrievalGate,
     private val prefs: PreferenceManager,
-    private val sessionTranscript: SessionTranscript,
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private val mutex = Mutex()
+    private val writeMutex = Mutex()
+    private val migrateOnce = java.util.concurrent.atomic.AtomicBoolean(false)
 
-    val memoryParagraph: Flow<String> = prefs.memoryParagraph
+    /** Memorable turns waiting for MiniLM/assets to become ready. Guarded by [writeMutex]. */
+    private val pendingIndex = ArrayDeque<String>()
 
-    suspend fun getMemoryParagraph(): String =
-        LlmPromptDefaults.clampMemoryParagraph(prefs.getMemoryParagraph())
-
-    suspend fun clearMemory() {
-        prefs.setMemoryParagraph("")
-    }
-
-    /** Record a successful turn for later session flush (no LLM call). */
-    fun recordTurn(userText: String, assistantText: String) {
-        sessionTranscript.record(userText, assistantText)
-    }
+    val memoryChunks: StateFlow<List<String>> = ragMemoryStore.chunks
 
     /**
-     * Fire-and-forget: summarize the pending session into long-term memory.
-     * Intended for Home screen (and similar app foreground entry).
+     * Decide whether to pull LTM for [userText] and return a prompt-sized context string.
+     * Runs embedding/search on IO.
      */
-    fun scheduleFlushSession() {
-        if (sessionTranscript.isEmpty()) return
-        scope.launch {
-            runCatching { flushSessionNow() }
-                .onFailure { Log.w(TAG, "Session memory flush failed", it) }
+    suspend fun retrieveForChat(userText: String): String = withContext(Dispatchers.IO) {
+        writeMutex.withLock { migrateLegacyLocked() }
+        if (!retrievalGate.shouldRetrieve(userText)) {
+            Log.d(TAG, "LTM retrieve skipped by gate")
+            return@withContext ""
+        }
+        if (!ragMemoryStore.ensureReady()) {
+            Log.d(TAG, "LTM retrieve skipped (store not ready)")
+            return@withContext ""
+        }
+        val chunks = ragMemoryStore.retrieve(userText, topK = RETRIEVE_TOP_K)
+        if (chunks.isEmpty()) {
+            Log.d(TAG, "LTM retrieve empty")
+            return@withContext ""
+        }
+        // Rewrite first-person user lines into third-person friend facts so the tiny
+        // model does not adopt them ("I like cookie" → "I'm not a smart cookie").
+        val joined = chunks.joinToString(separator = "; ") { friendFactForPrompt(it) }
+        val clamped = LlmPromptDefaults.clampRetrievedMemory(joined)
+        Log.d(TAG, "LTM retrieve ok chunks=${chunks.size} len=${clamped.length}")
+        clamped
+    }
+
+    /** Prompt-only rewrite; storage keeps the original user utterance. */
+    private fun friendFactForPrompt(raw: String): String {
+        val t = raw.trim().trimEnd('.', '!', '?')
+        if (t.isEmpty()) return t
+        val lower = t.lowercase()
+        return when {
+            lower.startsWith("i like ") -> "friend likes ${t.drop(7).trim()}"
+            lower.startsWith("i love ") -> "friend loves ${t.drop(7).trim()}"
+            lower.startsWith("i hate ") -> "friend dislikes ${t.drop(7).trim()}"
+            lower.startsWith("i prefer ") -> "friend prefers ${t.drop(9).trim()}"
+            lower.startsWith("my name is ") -> "friend's name is ${t.drop(11).trim()}"
+            lower.startsWith("i'm ") -> "friend is ${t.drop(4).trim()}"
+            lower.startsWith("i am ") -> "friend is ${t.drop(5).trim()}"
+            lower.startsWith("i live ") -> "friend lives ${t.drop(7).trim()}"
+            lower.startsWith("do you know ") -> friendFactForPrompt(t.drop(12).trim())
+            else -> "friend said: $t"
         }
     }
 
-    suspend fun flushSessionNow() {
-        mutex.withLock {
-            val turns = sessionTranscript.snapshotAndClear()
-            if (turns.isEmpty()) return
+    /**
+     * Fire-and-forget: index a memorable user turn on IO. Safe to call from any thread.
+     */
+    fun scheduleIndexTurn(userText: String, assistantText: String) {
+        scope.launch {
+            runCatching { indexTurnNow(userText, assistantText) }
+                .onFailure { Log.w(TAG, "Background memory index failed", it) }
+        }
+    }
 
-            val friendLines = turns.map { it.userText }
-                .map { LlmPromptDefaults.sanitizeParagraph(it) }
-                .filter { it.isNotEmpty() && LlmPromptDefaults.looksLikeMemorableUserTurn(it) }
-                .distinct()
+    /**
+     * Warm RAG store, migrate legacy paragraph, and drain any pending indexes (IO).
+     */
+    fun scheduleFlushSession() {
+        scope.launch {
+            runCatching {
+                writeMutex.withLock {
+                    migrateLegacyLocked()
+                    if (ragMemoryStore.ensureReady()) {
+                        drainPendingLocked()
+                    }
+                }
+            }.onFailure { Log.w(TAG, "Memory flush/warm failed", it) }
+        }
+    }
 
-            if (friendLines.isEmpty()) {
-                Log.d(TAG, "Session flush skipped (${turns.size} turns, none memorable)")
-                return
-            }
+    suspend fun clearMemory() = withContext(Dispatchers.IO) {
+        writeMutex.withLock {
+            pendingIndex.clear()
+            ragMemoryStore.clear()
+            prefs.setMemoryParagraph("")
+        }
+    }
 
-            val current = getMemoryParagraph()
-            Log.d(
-                TAG,
-                "Flushing session → memory (${friendLines.size} fact lines from ${turns.size} turns)",
-            )
-            val updated = llmService.consolidateSession(current, friendLines)
-            if (updated.isBlank()) {
-                Log.d(TAG, "Memory unchanged after session flush (NONE / rejected)")
+    private suspend fun indexTurnNow(userText: String, assistantText: String) {
+        writeMutex.withLock {
+            migrateLegacyLocked()
+
+            val user = LlmPromptDefaults.sanitizeParagraph(userText)
+                .take(LlmPromptDefaults.MAX_CHARS_PER_TURN)
+            if (user.isEmpty()) return
+            if (!LlmPromptDefaults.looksLikeMemorableUserTurn(user)) {
+                Log.d(TAG, "Index skipped (not memorable)")
                 return
             }
-            val clamped = LlmPromptDefaults.clampMemoryParagraph(updated)
-            if (clamped.isEmpty()) {
-                prefs.setMemoryParagraph("")
+            if (LlmPromptDefaults.isCannedFallback(assistantText)) return
+
+            if (!ragMemoryStore.ensureReady()) {
+                enqueuePendingLocked(user)
+                Log.d(TAG, "Index queued — store not ready (pending=${pendingIndex.size})")
                 return
             }
-            if (LlmPromptDefaults.isSameMemory(clamped, current)) {
-                Log.d(TAG, "Memory unchanged (duplicate of current)")
+            drainPendingLocked()
+            val ok = ragMemoryStore.index(user)
+            Log.d(TAG, if (ok) "Indexed turn" else "Index returned false")
+        }
+    }
+
+    /** Caller must hold [writeMutex]. */
+    private suspend fun drainPendingLocked() {
+        if (pendingIndex.isEmpty()) return
+        if (!ragMemoryStore.isReady && !ragMemoryStore.ensureReady()) return
+        while (pendingIndex.isNotEmpty()) {
+            val text = pendingIndex.removeFirst()
+            val ok = runCatching { ragMemoryStore.index(text) }
+                .onFailure { Log.w(TAG, "Pending index failed", it) }
+                .getOrDefault(false)
+            if (!ok) {
+                pendingIndex.addFirst(text)
                 return
             }
-            prefs.setMemoryParagraph(clamped)
-            Log.d(TAG, "Memory updated from session (${clamped.length} chars): ${clamped.take(160)}")
+        }
+    }
+
+    /** Caller must hold [writeMutex]. */
+    private fun enqueuePendingLocked(text: String) {
+        if (pendingIndex.lastOrNull() == text) return
+        pendingIndex.addLast(text)
+        while (pendingIndex.size > MAX_PENDING) {
+            pendingIndex.removeFirst()
+        }
+    }
+
+    /** Caller must hold [writeMutex]. */
+    private suspend fun migrateLegacyLocked() {
+        if (!migrateOnce.compareAndSet(false, true)) return
+        val legacy = prefs.getMemoryParagraph().trim()
+        if (legacy.isEmpty()) return
+        if (!ragMemoryStore.ensureReady()) {
+            migrateOnce.set(false)
+            enqueuePendingLocked(legacy)
+            return
+        }
+        Log.i(TAG, "Migrating legacy memory paragraph into RAG (${legacy.length} chars)")
+        val ok = ragMemoryStore.index(legacy)
+        if (ok) {
+            prefs.setMemoryParagraph("")
+        } else {
+            migrateOnce.set(false)
+            enqueuePendingLocked(legacy)
         }
     }
 
     companion object {
         private const val TAG = "MemoryPipeline"
+        private const val RETRIEVE_TOP_K = 3
+        private const val MAX_PENDING = 64
     }
 }

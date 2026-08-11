@@ -35,7 +35,10 @@ class PreferenceManager(private val context: Context) {
     val ttsVolume: Flow<Float> = context.dataStore.data.map {
         it[Keys.TTS_VOLUME] ?: 1f
     }
-    /** Long-term pet memory as one short paragraph. */
+    /**
+     * Legacy long-term memory paragraph (pre-RAG). Kept for one-shot migration into the
+     * vector store; new writes should go through [com.kawaiipet.app.memory.rag.RagMemoryStore].
+     */
     val memoryParagraph: Flow<String> = context.dataStore.data.map {
         LlmPromptDefaults.clampMemoryParagraph(it[Keys.MEMORY_PARAGRAPH].orEmpty())
     }
@@ -135,7 +138,8 @@ class PreferenceManager(private val context: Context) {
         private val LEGACY_STT_MODEL_IDS = setOf(
             "moonshine-tiny-en-quantized",
             "sherpa-onnx-moonshine-tiny-en-quantized-2026-02-27",
-            "sherpa-onnx-moonshine-base-en-quantized-2026-02-27",
+            // Previous default — upgrade to Moonshine base for better English accuracy.
+            "sherpa-onnx-nemo-ctc-en-conformer-small",
         )
 
         private fun migrateSttModelId(id: String): String =

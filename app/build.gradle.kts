@@ -120,12 +120,16 @@ android {
         jniLibs {
             // 16 KB page-size compatibility (Android 15+).
             useLegacyPackaging = false
+            // Safety net if another AAR also ships ORT.
+            pickFirsts += "**/libonnxruntime.so"
         }
     }
 
 }
 
-// Sherpa-ONNX AAR bundles libonnxruntime.so per ABI; we repack the AAR as-is (no second ORT dependency).
+// Sherpa-ONNX AAR is already 16KB page-size compatible (see app/libs/README.txt).
+// We strip its bundled libonnxruntime.so and use onnxruntime-android instead so MiniLM
+// can use the Java ORT API (libonnxruntime4j_jni.so). Keep ORT >= 1.22 for 16KB JNI.
 // https://github.com/k2-fsa/sherpa-onnx/releases
 private val sherpaOnnxReleaseVersion = "1.12.35"
 private val sherpaOnnxAarFile = layout.projectDirectory.file("libs/sherpa-onnx-$sherpaOnnxReleaseVersion.aar")
@@ -159,6 +163,9 @@ tasks.register("prepareSherpaOnnxAppAar") {
                 JZipOutputStream(fos).use { zos ->
                     for (e in zf.entries()) {
                         if (e.isDirectory) continue
+                        // Drop Sherpa's bundled ORT so onnxruntime-android can own
+                        // libonnxruntime.so (+ libonnxruntime4j_jni.so for MiniLM).
+                        if (e.name.endsWith("libonnxruntime.so")) continue
                         val outEntry = JZipEntry(e.name).apply { time = e.time }
                         zos.putNextEntry(outEntry)
                         zf.getInputStream(e).use { input -> input.copyTo(zos) }
@@ -213,6 +220,13 @@ dependencies {
 
     // Google LiteRT-LM (SmolLM2 on-device)
     implementation(libs.litertlm.android)
+
+    // Google AI Edge RAG (SqliteVectorStore + SemanticTextMemory)
+    implementation(libs.localagents.rag)
+    // SqliteVectorStore serializes via protobuf lite; not pulled in unless tasks-genai is present.
+    implementation(libs.protobuf.javalite)
+    implementation(libs.onnxruntime.android)
+    implementation(libs.coroutines.guava)
 
     // tar.bz2 extraction for Sherpa voice packs
     implementation(libs.commons.compress)

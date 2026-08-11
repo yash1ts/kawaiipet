@@ -16,6 +16,12 @@ object SttEngineConfig {
      */
     const val FEATURE_DITHER = 1.0e-5f
 
+    /**
+     * Offline transducer blank penalty (no-op for Moonshine / NeMo CTC in sherpa-onnx).
+     * Kept mild for any future offline transducer STT.
+     */
+    const val OFFLINE_BLANK_PENALTY = 0.85f
+
     fun featureConfig(): FeatureConfig =
         FeatureConfig(SAMPLE_RATE, FEATURE_DIM, FEATURE_DITHER)
 

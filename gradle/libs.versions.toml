@@ -15,6 +15,11 @@ coreKtx = "1.15.0"
 posthog = "3.31.0"
 litertLm = "0.15.0"
 commonsCompress = "1.27.1"
+localagentsRag = "0.3.0"
+onnxruntime = "1.23.2"
+coroutinesGuava = "1.11.0"
+# Required by localagents-rag SqliteVectorStore (optional tasks-genai otherwise).
+protobufJavalite = "4.28.3"
 [libraries]
 compose-bom = { group = "androidx.compose", name = "compose-bom", version.ref = "composeBom" }
 compose-ui = { group = "androidx.compose.ui", name = "ui" }
@@ -52,6 +57,10 @@ posthog-android = { group = "com.posthog", name = "posthog-android", version.ref
 
 litertlm-android = { group = "com.google.ai.edge.litertlm", name = "litertlm-android", version.ref = "litertLm" }
 commons-compress = { group = "org.apache.commons", name = "commons-compress", version.ref = "commonsCompress" }
+localagents-rag = { group = "com.google.ai.edge.localagents", name = "localagents-rag", version.ref = "localagentsRag" }
+onnxruntime-android = { group = "com.microsoft.onnxruntime", name = "onnxruntime-android", version.ref = "onnxruntime" }
+coroutines-guava = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-guava", version.ref = "coroutinesGuava" }
+protobuf-javalite = { group = "com.google.protobuf", name = "protobuf-javalite", version.ref = "protobufJavalite" }
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }
 kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }

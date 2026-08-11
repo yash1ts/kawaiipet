@@ -6,15 +6,15 @@ import javax.inject.Inject
 import javax.inject.Singleton
 
 /**
- * Legacy entry point — session turns are recorded on [MemoryPipeline]; flush happens on Home.
+ * Legacy entry point — memorable turns are indexed into RAG on a background IO thread.
  */
 @Singleton
 class FactExtractor @Inject constructor(
     private val memoryPipeline: MemoryPipeline,
 ) {
     fun extractAndStoreAsync(userText: String, assistantText: String) {
-        Log.d(TAG, "Recording turn for later session flush")
-        memoryPipeline.recordTurn(userText, assistantText)
+        Log.d(TAG, "Scheduling background RAG index")
+        memoryPipeline.scheduleIndexTurn(userText, assistantText)
     }
 
     companion object {

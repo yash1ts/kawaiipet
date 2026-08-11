@@ -11,7 +11,7 @@ class HomeViewModel @Inject constructor(
 ) : ViewModel() {
     fun canStartPet(): Boolean = true
 
-    /** Summarize the last pet session into long-term memory (once per pending transcript). */
+    /** Warm RAG store / migrate legacy paragraph on Home (background IO). */
     fun flushSessionMemory() {
         memoryPipeline.scheduleFlushSession()
     }

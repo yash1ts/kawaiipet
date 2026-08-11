@@ -86,87 +86,8 @@ class SmolLmLlmService @Inject constructor(
         }
     }
 
-    override suspend fun consolidateSession(
-        currentMemory: String,
-        friendLines: List<String>,
-    ): String = withContext(Dispatchers.Default) {
-        val lines = friendLines
-            .map { LlmPromptDefaults.sanitizeParagraph(it).take(120) }
-            .filter { it.isNotEmpty() && LlmPromptDefaults.looksLikeMemorableUserTurn(it) }
-            .distinct()
-            .take(MAX_SESSION_FACT_LINES)
-        if (lines.isEmpty()) return@withContext ""
-
-        val engine = smolLm.ensureReady()
-        val currentClean = LlmPromptDefaults.sanitizeMemoryParagraph(currentMemory)
-        val userTurn = buildString {
-            if (currentClean.isNotEmpty()) {
-                append(currentClean).append('\n')
-            }
-            for (line in lines) {
-                append("+ ").append(line).append('\n')
-            }
-            append("Short:")
-        }
-
-        Log.d(
-            TAG,
-            "consolidateSession currentLen=${currentClean.length} factLines=${lines.size}",
-        )
-
-        val config = ConversationConfig(
-            systemInstruction = Contents.of(MEMORY_UTILITY_SYSTEM),
-            initialMessages = emptyList(),
-            samplerConfig = SamplerConfig(
-                topK = LlmPromptDefaults.UTILITY_TOP_K,
-                topP = LlmPromptDefaults.UTILITY_TOP_P,
-                temperature = LlmPromptDefaults.UTILITY_TEMPERATURE,
-            ),
-            maxOutputToken = LlmPromptDefaults.UTILITY_MAX_OUTPUT_TOKENS,
-        )
-
-        engine.createConversation(config).use { conversation ->
-            val raw = conversation.sendMessage(userTurn).toString().trim()
-            Log.d(TAG, "consolidateSession raw (${raw.length}): ${raw.take(180).replace('\n', ' ')}")
-            val cleaned = LlmPromptDefaults.sanitizeMemoryParagraph(raw)
-            if (cleaned.isEmpty()) {
-                Log.d(TAG, "consolidateSession rejected empty/junk raw")
-                return@withContext ""
-            }
-            val clamped = LlmPromptDefaults.clampMemoryParagraph(cleaned)
-            if (clamped.isEmpty()) return@withContext ""
-            if (LlmPromptDefaults.isSameMemory(clamped, currentClean)) {
-                Log.d(TAG, "consolidateSession unchanged (same as current after dedupe)")
-                return@withContext ""
-            }
-            val clampedKey = LlmPromptDefaults.normalizeMemoryKey(clamped)
-            val currentKey = LlmPromptDefaults.normalizeMemoryKey(currentClean)
-            val absorbedNew = lines.any { line ->
-                val key = LlmPromptDefaults.normalizeMemoryKey(line)
-                key.isNotEmpty() && clampedKey.contains(key.take(24))
-            }
-            val grew = clampedKey.length > currentKey.length + 8
-            if (currentKey.isNotEmpty() && !absorbedNew && !grew) {
-                Log.d(TAG, "consolidateSession ignored (no new fact absorbed)")
-                return@withContext ""
-            }
-            Log.d(TAG, "consolidateSession ok (${clamped.length}): ${clamped.take(160)}")
-            clamped
-        }
-    }
-
     companion object {
         private const val TAG = "SmolLmLlmService"
-        private const val MAX_SESSION_FACT_LINES = 16
-
-        // Compress durable facts only — never define/explain topics from the chat.
-        private val MEMORY_UTILITY_SYSTEM =
-            "Write ONE short fact paragraph about the friend " +
-                "(max ${LlmPromptDefaults.MAX_MEMORY_WORDS} words). " +
-                "Merge old facts with each new \"+\" line from the session. " +
-                "Each fact once — never repeat a sentence. " +
-                "Keep only: name, likes/dislikes, people, places, job, plans. " +
-                "Do not explain or define. If nothing new: NONE"
 
         /** Prior messages only (excludes the latest user turn already sent as the prompt). */
         private fun buildHistoryMessages(messages: List<ChatMessage>): List<Message> {
