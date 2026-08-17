@@ -42,6 +42,7 @@ class KawaiiPetApplication : Application() {
         CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
             runCatching {
                 preferenceManager.migratePersonalityDefaultIfNeeded()
+                preferenceManager.migrateLlmSamplerIfNeeded()
                 preferenceManager.migrateSttModelIfNeeded()
                 preferenceManager.migrateTtsVolumeDefaultIfNeeded()
                 memoryRepository.purgeContaminatedFacts()

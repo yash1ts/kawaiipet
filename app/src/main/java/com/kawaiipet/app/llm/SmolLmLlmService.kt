@@ -303,15 +303,20 @@ class SmolLmLlmService @Inject constructor(
             return null to null
         }
         val cfg = sessionConfigStore.snapshot()
+        val ngram = if (cfg.noRepeatNgramSize > 0) {
+            NoRepeatNgramConfig(
+                noRepeatNgramSize = cfg.noRepeatNgramSize,
+                windowSize = LlmPromptDefaults.NO_REPEAT_NGRAM_WINDOW,
+            )
+        } else {
+            null
+        }
         return RepetitionPenaltyConfig(
             repetitionPenalty = cfg.repetitionPenalty,
             presencePenalty = cfg.presencePenalty,
             frequencyPenalty = cfg.frequencyPenalty,
             windowSize = LlmPromptDefaults.PENALTY_WINDOW_SIZE,
-        ) to NoRepeatNgramConfig(
-            noRepeatNgramSize = cfg.noRepeatNgramSize,
-            windowSize = LlmPromptDefaults.NO_REPEAT_NGRAM_WINDOW,
-        )
+        ) to ngram
     }
 
     private fun isLogitsDimensionError(t: Throwable): Boolean {

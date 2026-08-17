@@ -323,11 +323,11 @@ class AudioPipeline(
                     // detection — this silence window delays every response.
                     putExtra(
                         RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS,
-                        800L
+                        1_500L
                     )
                     putExtra(
                         RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS,
-                        600L
+                        1_200L
                     )
                 }
 

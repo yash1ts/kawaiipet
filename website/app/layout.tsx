@@ -9,9 +9,9 @@ const dmSans = DM_Sans({
 });
 
 export const metadata: Metadata = {
-  title: "KawaiiPet — Your pocket pet on Android",
+  title: "KawaiiPet — A tiny friend on your screen",
   description:
-    "A playful on-screen companion for Android. Chat, customize, and keep your pet with you. Direct APK install.",
+    "Tap to talk with an on-screen pet for Android. It chats with you, remembers what matters, and works fully offline so your conversations stay private.",
 };
 
 export default function RootLayout({

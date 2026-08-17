@@ -21,7 +21,7 @@
     <string name="vad_threshold_hint">Higher ignores more room noise; lower hears softer speech. Default 0.50.</string>
     <string name="vad_silence_label">End-of-speech pause</string>
     <string name="vad_silence_value">%1$s s</string>
-    <string name="vad_silence_hint">How long you must pause before the pet starts thinking. Default 0.8s.</string>
+    <string name="vad_silence_hint">How long you must pause before the pet starts thinking. Default 1.5s.</string>
     <string name="settings_on_device_ai_section">On-device models</string>
     <string name="settings_models_summary">Models download on first launch. Chat uses LFM2.5-1.2B Instruct via LiteRT-LM; voice uses Sherpa-ONNX (Moonshine STT + KittenTTS).</string>
     <string name="customize_title">Customize pet</string>

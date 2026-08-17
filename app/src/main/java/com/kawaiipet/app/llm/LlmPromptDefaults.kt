@@ -46,13 +46,13 @@ object LlmPromptDefaults {
     const val DIDNT_CATCH_REPLY = "Huh? Say that again for me?"
 
     /**
-     * Cooler / tighter than chat-default so 1.2B GPU turns stay on the latest line
-     * (GPU skips decode penalties, so token cap is the ramble brake).
+     * Liquid AI LFM2.5-1.2B-Instruct card / vLLM recipe:
+     * temperature 0.1, top_k 50, top_p 0.1, repetition_penalty 1.05.
      */
-    const val SAMPLER_TOP_K = 30
-    const val SAMPLER_TOP_P = 0.85
-    const val SAMPLER_TEMPERATURE = 0.65
-    /** ~1–2 spoken sentences. 256 let the model dump greetings + helper questions. */
+    const val SAMPLER_TOP_K = 50
+    const val SAMPLER_TOP_P = 0.1
+    const val SAMPLER_TEMPERATURE = 0.1
+    /** Spoken-turn cap (not from the model card). 1–2 sentences. */
     const val MAX_OUTPUT_TOKENS = 72
 
     /**
@@ -60,28 +60,24 @@ object LlmPromptDefaults {
      * Applied on sendMessageAsync on CPU only. GPU logits-shape crashes if these
      * are attached, so GPU generations skip them.
      *
-     * - repetitionPenalty (>= 1): HuggingFace-style multiplicative
-     * - presencePenalty: OpenAI-style once-seen token nudge
-     * - frequencyPenalty: OpenAI-style scales with how often a token reappears
-     * - windowSize 0 = whole current reply (fits [MAX_OUTPUT_TOKENS])
+     * Official LFM2.5 Instruct uses repetition_penalty 1.05 only.
      */
-    const val REPETITION_PENALTY = 1.25f
+    const val REPETITION_PENALTY = 1.05f
     const val REPETITION_PENALTY_MIN = 1.0f
     const val REPETITION_PENALTY_MAX = 2.0f
-    const val PRESENCE_PENALTY = 1.5f
+    const val PRESENCE_PENALTY = 0.0f
     const val PRESENCE_PENALTY_MIN = 0.0f
     const val PRESENCE_PENALTY_MAX = 2.0f
-    const val FREQUENCY_PENALTY = 0.4f
+    const val FREQUENCY_PENALTY = 0.0f
     const val FREQUENCY_PENALTY_MIN = 0.0f
     const val FREQUENCY_PENALTY_MAX = 2.0f
     const val PENALTY_WINDOW_SIZE = 0
 
     /**
      * Ban exact n-gram repeats in the current reply ([NoRepeatNgramConfig]).
-     * Size 4 stops "Please don't be so sorry" loops without blocking normal words.
-     * 0 disables n-gram banning.
+     * 0 = off (LFM2.5 card does not use n-gram bans).
      */
-    const val NO_REPEAT_NGRAM_SIZE = 4
+    const val NO_REPEAT_NGRAM_SIZE = 0
     const val NO_REPEAT_NGRAM_SIZE_MIN = 0
     const val NO_REPEAT_NGRAM_SIZE_MAX = 8
     const val NO_REPEAT_NGRAM_WINDOW = 0
@@ -102,7 +98,7 @@ object LlmPromptDefaults {
             append("You are $name, a tiny pet friend. $vibe\n")
             append("Be curious about their life. Reply to what they just said, then ask one small question about them. ")
             append("One or two short spoken sentences. Plain speech. ")
-            append("Never call yourself an assistant or ask how you can help.")
+            append("Never call yourself an assistant or ask how you can help. Stay in character as a pet friend.")
         }
     }
 

@@ -200,6 +200,20 @@ class PreferenceManager(private val context: Context) {
         }
     }
 
+    /** Pick up LFM2.5 card sampler penalties when the shipped defaults bump. */
+    suspend fun migrateLlmSamplerIfNeeded() {
+        context.dataStore.edit { prefs ->
+            val version = prefs[Keys.LLM_SAMPLER_VERSION] ?: 0
+            if (version < LLM_SAMPLER_PREF_VERSION) {
+                prefs[Keys.REPETITION_PENALTY] = LlmPromptDefaults.REPETITION_PENALTY
+                prefs[Keys.PRESENCE_PENALTY] = LlmPromptDefaults.PRESENCE_PENALTY
+                prefs[Keys.FREQUENCY_PENALTY] = LlmPromptDefaults.FREQUENCY_PENALTY
+                prefs[Keys.NO_REPEAT_NGRAM_SIZE] = LlmPromptDefaults.NO_REPEAT_NGRAM_SIZE
+                prefs[Keys.LLM_SAMPLER_VERSION] = LLM_SAMPLER_PREF_VERSION
+            }
+        }
+    }
+
     /** Point prefs at the current default STT when an older tiny model id is stored. */
     suspend fun migrateSttModelIfNeeded() {
         context.dataStore.edit { prefs ->
@@ -338,8 +352,8 @@ class PreferenceManager(private val context: Context) {
 
     private fun resolveVadMinSilenceSec(stored: Float?): Float {
         val raw = stored ?: return VadEngineConfig.MIN_SILENCE_SEC
-        // 0.20 / 0.40 defaults cut mid-sentence; pick up the new wait automatically.
-        if (raw <= SNAPPY_VAD_SILENCE_SEC) return VadEngineConfig.MIN_SILENCE_SEC
+        // 0.20 / 0.40 / 0.80 defaults still cut mid-sentence; pick up the new wait.
+        if (raw <= SHORT_VAD_SILENCE_SEC) return VadEngineConfig.MIN_SILENCE_SEC
         return raw.coerceIn(VadEngineConfig.MIN_SILENCE_SEC_MIN, VadEngineConfig.MIN_SILENCE_SEC_MAX)
     }
 
@@ -359,6 +373,7 @@ class PreferenceManager(private val context: Context) {
         val PRESENCE_PENALTY = floatPreferencesKey("llm_presence_penalty")
         val FREQUENCY_PENALTY = floatPreferencesKey("llm_frequency_penalty")
         val NO_REPEAT_NGRAM_SIZE = intPreferencesKey("llm_no_repeat_ngram_size")
+        val LLM_SAMPLER_VERSION = intPreferencesKey("llm_sampler_version")
         val MEMORY_PARAGRAPH = stringPreferencesKey("memory_paragraph")
         val USAGE_REMINDER_ENABLED = booleanPreferencesKey("usage_reminder_enabled")
         val USAGE_REMINDER_TARGETS_JSON = stringPreferencesKey("usage_reminder_targets_json")
@@ -377,6 +392,9 @@ class PreferenceManager(private val context: Context) {
         const val TTS_VOLUME_DEFAULT = 1.0f
         private const val TTS_VOLUME_PREF_VERSION = 2
 
+        /** Bump when shipped LFM sampler penalties change. */
+        private const val LLM_SAMPLER_PREF_VERSION = 1
+
         /** Pet voice rate for Sherpa synth + AudioTrack playback (both use this). */
         const val TTS_SPEED_MIN = 0.8f
         const val TTS_SPEED_MAX = 1.5f
@@ -387,8 +405,8 @@ class PreferenceManager(private val context: Context) {
         const val USAGE_REMINDER_LIMIT_DEFAULT_MIN = 30
         const val USAGE_REMINDER_MAX_APPS = 5
 
-        /** Stored silence at or below this is the old snappy default and is migrated. */
-        private const val SNAPPY_VAD_SILENCE_SEC = 0.41f
+        /** Stored silence at or below this is an older aggressive default and is migrated. */
+        private const val SHORT_VAD_SILENCE_SEC = 1.21f
 
         private val LEGACY_TTS_MODEL_IDS = setOf(
             "piper-en_US-amy-medium",

@@ -19,11 +19,11 @@ object VadEngineConfig {
 
     /**
      * How long trailing non-speech must last before Silero closes a segment.
-     * Long enough for a mid-sentence breath so we don't cut the user off.
+     * 1.5s so a mid-sentence pause does not cut the user off.
      */
-    const val MIN_SILENCE_SEC = 0.80f
-    const val MIN_SILENCE_SEC_MIN = 0.20f
-    const val MIN_SILENCE_SEC_MAX = 1.20f
+    const val MIN_SILENCE_SEC = 1.50f
+    const val MIN_SILENCE_SEC_MIN = 0.40f
+    const val MIN_SILENCE_SEC_MAX = 2.50f
 
     /**
      * Ignore brief noise blips shorter than this before counting as speech.
@@ -45,7 +45,7 @@ object VadEngineConfig {
 
     /**
      * Backup end-of-utterance if Silero segment hasn't flushed yet.
-     * ~25 × 32 ms ≈ 0.80 s, matched to [MIN_SILENCE_SEC].
+     * ~47 × 32 ms ≈ 1.5 s, matched to [MIN_SILENCE_SEC].
      */
-    const val SILENCE_END_CHUNKS = 25
+    const val SILENCE_END_CHUNKS = 47
 }
