@@ -1,7 +1,7 @@
 package com.kawaiipet.app.llm
 
 /**
- * Prompt + sampler defaults for on-device Qwen3-0.6B (no-think INT4) via LiteRT-LM.
+ * Prompt + sampler defaults for on-device LFM2.5-1.2B-Instruct INT4 via LiteRT-LM.
  *
  * Long-term memory is RAG-retrieved chunks (prompt-sized); short-term is recent messages.
  */
@@ -15,20 +15,21 @@ object LlmPromptDefaults {
 
     /**
      * Shipped Mochi personality — a pet friend you hang out with, not a helper bot.
-     * Keep short: Qwen3-0.6B follows brief role cues best for spoken pet turns.
+     * Keep short: small on-device models follow brief role cues best for spoken pet turns.
      */
     const val DEFAULT_PERSONALITY =
-        "Cozy playful virtual pet friend. Chat about daily life, feelings, and little moments. "
+        "Warm, playful, curious. "
 
     /** Bump when [DEFAULT_PERSONALITY] changes so stored prefs refresh. */
-    const val PERSONALITY_DEFAULT_VERSION = 12
+    const val PERSONALITY_DEFAULT_VERSION = 17
 
     /**
-     * Hard caps for spoken pet replies.
+     * Hard caps for spoken pet replies. Prompt still asks for 1–2 sentences;
+     * these only stop a runaway decode / TTS dump.
      */
-    const val MAX_REPLY_WORDS = 48
+    const val MAX_REPLY_WORDS = 64
     const val MAX_REPLY_SENTENCES = 3
-    const val MAX_SPOKEN_CHARS = 280
+    const val MAX_SPOKEN_CHARS = 220
     const val MAX_CHARS_PER_TURN = 320
 
     /** Legacy paragraph prefs / migration clamp only — storage itself is uncapped in RAG. */
@@ -40,30 +41,24 @@ object LlmPromptDefaults {
     const val MAX_RETRIEVED_MEMORY_CHARS = 400
 
     /** Keep the last N chat messages as short-term history (full text, not summarized). */
-    const val MAX_SHORT_TERM_MESSAGES = 6
+    const val MAX_SHORT_TERM_MESSAGES = 10
 
     const val DIDNT_CATCH_REPLY = "Huh? Say that again for me?"
-    const val GREETING_FALLBACK = "Hey! I'm good — how are you doing?"
-    const val STATUS_FALLBACK = "Aww, glad you're good! What's been going on?"
-    const val CAPABILITY_FALLBACK =
-        "I'm your pet friend — talk to me about anything in your life."
-    const val CURIOUS_FALLBACK = "Ooh, I'm listening — tell me more?"
-    const val CLARIFY_FALLBACK = "Remind you of what? I'm right here."
 
     /**
-     * Sampler defaults for Qwen3-0.6B no-think — balanced friend chat
-     * (not as tight as 0.5/48, not as loose as 0.75/96).
+     * Cooler / tighter than chat-default so 1.2B GPU turns stay on the latest line
+     * (GPU skips decode penalties, so token cap is the ramble brake).
      */
     const val SAMPLER_TOP_K = 30
-    const val SAMPLER_TOP_P = 0.9
+    const val SAMPLER_TOP_P = 0.85
     const val SAMPLER_TEMPERATURE = 0.65
-    /** ~2 short spoken sentences + emotion tag. */
+    /** ~1–2 spoken sentences. 256 let the model dump greetings + helper questions. */
     const val MAX_OUTPUT_TOKENS = 72
 
     /**
-     * Decode penalties for short pet replies (LiteRT-LM [RepetitionPenaltyConfig]).
-     * Applied only to the current generation window — keeps "I'm good…" / phrase loops down
-     * without crushing natural buddy chat.
+     * Decode penalties (LiteRT-LM [RepetitionPenaltyConfig]).
+     * Applied on sendMessageAsync on CPU only. GPU logits-shape crashes if these
+     * are attached, so GPU generations skip them.
      *
      * - repetitionPenalty (>= 1): HuggingFace-style multiplicative
      * - presencePenalty: OpenAI-style once-seen token nudge
@@ -71,20 +66,29 @@ object LlmPromptDefaults {
      * - windowSize 0 = whole current reply (fits [MAX_OUTPUT_TOKENS])
      */
     const val REPETITION_PENALTY = 1.25f
-    const val PRESENCE_PENALTY = 0.5f
+    const val REPETITION_PENALTY_MIN = 1.0f
+    const val REPETITION_PENALTY_MAX = 2.0f
+    const val PRESENCE_PENALTY = 1.5f
+    const val PRESENCE_PENALTY_MIN = 0.0f
+    const val PRESENCE_PENALTY_MAX = 2.0f
     const val FREQUENCY_PENALTY = 0.4f
+    const val FREQUENCY_PENALTY_MIN = 0.0f
+    const val FREQUENCY_PENALTY_MAX = 2.0f
     const val PENALTY_WINDOW_SIZE = 0
 
     /**
      * Ban exact n-gram repeats in the current reply ([NoRepeatNgramConfig]).
      * Size 4 stops "Please don't be so sorry" loops without blocking normal words.
+     * 0 disables n-gram banning.
      */
     const val NO_REPEAT_NGRAM_SIZE = 4
+    const val NO_REPEAT_NGRAM_SIZE_MIN = 0
+    const val NO_REPEAT_NGRAM_SIZE_MAX = 8
     const val NO_REPEAT_NGRAM_WINDOW = 0
 
     /**
-     * Stable system prompt for Qwen3-0.6B — short role + friend chat style.
-     * App open/play intents are handled by keyword NLU, not this prompt.
+     * Stable system prompt. LFM2.5 ChatML already labels user/assistant turns;
+     * keep this as role only, not a fake transcript.
      */
     fun buildSystemPrompt(
         petName: String,
@@ -93,69 +97,46 @@ object LlmPromptDefaults {
         @Suppress("UNUSED_PARAMETER") openAppIds: String = "",
     ): String {
         val name = petName.trim().ifEmpty { "Mochi" }
-        // Keep the system preface short — prefill cost scales with this.
-        val vibe = personality.trim().ifEmpty { DEFAULT_PERSONALITY }.take(120)
+        val vibe = personality.trim().ifEmpty { DEFAULT_PERSONALITY }.take(160)
         return buildString {
-            append("You are $name, their tiny pet friend. $vibe\n")
-            append("Answer what they just said as a close buddy. And sometimes ask questions about their life. ")
-            append("1–2 short spoken sentences. No apologies about the chat. Don't echo them. ")
-            append("You can suggest music, movies, books etc if asked.")
-            append("Plain speech only. ")
-            append("Finish with one emotion tag: [happy], [sad], [angry], or [thinking].")
-        }
-    }
-
-    /** True when the user is asking to open/play/launch something (keyword intent path). */
-    fun looksLikeActionIntent(userText: String): Boolean {
-        val n = userText.lowercase()
-        if (!Regex("\\b(open|launch|start|play|pull up|bring up|go to|fire up)\\b").containsMatchIn(n)) {
-            return false
-        }
-        // Play alone counts (song requests). Open/launch need an app-ish cue or stay broad.
-        if (Regex("\\bplay\\b").containsMatchIn(n)) return true
-        return Regex(
-            "youtube|spotify|chrome|browser|maps|camera|photos|gmail|settings|wifi|" +
-                "bluetooth|clock|calculator|calendar|messages|phone|playstore|play store|app",
-        ).containsMatchIn(n)
-    }
-
-    /** Prefix retrieved facts onto the user turn without changing the system prompt. */
-    fun attachMemoryToUserTurn(userText: String, memoryParagraph: String): String {
-        val memory = clampRetrievedMemory(memoryParagraph)
-        if (memory.isBlank()) return userText
-        // Keep the user line first so the model answers it, not the notes.
-        return buildString {
-            append(userText)
-            append("\nNotes: ")
-            append(memory)
+            append("You are $name, a tiny pet friend. $vibe\n")
+            append("Be curious about their life. Reply to what they just said, then ask one small question about them. ")
+            append("One or two short spoken sentences. Plain speech. ")
+            append("Never call yourself an assistant or ask how you can help.")
         }
     }
 
     /**
-     * Collapse "phrase phrase phrase" loops into a single phrase for TTS/bubble.
+     * User content for a ChatML `user` turn. Do not add "Human:" — LiteRT applies
+     * LFM2.5's Jinja template (`<|im_start|>user` / `<|im_start|>assistant`).
      */
-    fun collapseRepeatedPhrases(text: String): String {
-        val t = text.trim()
-        if (t.length < 12) return t
-        val words = t.split(Regex("\\s+")).filter { it.isNotEmpty() }
-        if (words.size < 4) return t
-        // Try phrase lengths 2..6 words.
-        for (n in 6 downTo 2) {
-            if (words.size < n * 2) continue
-            val phrase = words.take(n).joinToString(" ")
-            val phraseWords = phrase.split(" ")
-            var repeats = 1
-            var i = n
-            while (i + n <= words.size && words.subList(i, i + n) == phraseWords) {
-                repeats++
-                i += n
-            }
-            if (repeats >= 2 && i >= words.size - 1) {
-                return phrase.trimEnd(',', ';', '-', '—')
-            }
+    fun formatHistoryUserLine(userText: String): String = userText.trim()
+
+    /**
+     * Live user turn body. History is passed as separate ChatML messages, not inlined.
+     */
+    fun formatLiveUserTurn(
+        latestUser: String,
+        @Suppress("UNUSED_PARAMETER") priorMessages: List<ChatMessage>,
+        memoryParagraph: String = "",
+        @Suppress("UNUSED_PARAMETER") petName: String = "Mochi",
+    ): String {
+        val said = latestUser.trim()
+        val memory = clampRetrievedMemory(memoryParagraph)
+        return if (memory.isBlank()) {
+            said
+        } else {
+            "Notes: $memory\n$said"
         }
-        return t
     }
+
+    /** Prefix retrieved facts onto the user turn without changing the system prompt. */
+    fun attachMemoryToUserTurn(userText: String, memoryParagraph: String): String =
+        formatLiveUserTurn(
+            latestUser = userText,
+            priorMessages = emptyList(),
+            memoryParagraph = memoryParagraph,
+        )
 
     /**
      * Strips markdown / decorative formatting so TTS and the bubble stay plain speech.
@@ -175,16 +156,6 @@ object LlmPromptDefaults {
         // Headings / bullets
         t = Regex("(?m)^\\s{0,3}#{1,6}\\s+").replace(t, "")
         t = Regex("(?m)^\\s*[-*•]+\\s+").replace(t, "")
-        // Prompt-instruction leak the tiny model often copies into speech
-        t = Regex(
-            """(?i)\bend with\b[^.!?]*""",
-        ).replace(t, " ")
-        t = Regex(
-            """(?i)\bfinish with\b[^.!?]*""",
-        ).replace(t, " ")
-        t = Regex(
-            """(?i)\bthen one emotion tag\b[^.!?]*""",
-        ).replace(t, " ")
         // Any leftover decorative markers common in chat models
         t = t.replace("*", "")
             .replace("_", " ")
@@ -196,8 +167,8 @@ object LlmPromptDefaults {
     }
 
     /**
-     * Qwen3 may still emit `<think>…</think>` (empty for nothink, or leftover CoT).
-     * Drop closed blocks; if a think block is still open mid-stream, hold the tail.
+     * LFM2.5's chat template declares a `<think>` channel; drop closed blocks.
+     * If a think block is still open mid-stream, hold the tail.
      */
     fun stripThinkBlocks(text: String): String {
         if (text.isEmpty()) return text
@@ -216,9 +187,13 @@ object LlmPromptDefaults {
         return t
     }
 
-    /** Formatting-strip for anything shown or spoken. */
+    /** Cheap per-token strip while streaming (think blocks + whitespace only). */
+    fun sanitizeModelSpeechIncremental(text: String): String =
+        normalizeSpeechWhitespace(stripThinkBlocks(text))
+
+    /** Full formatting-strip for finalized speech / history. */
     fun sanitizeModelSpeech(text: String): String =
-        collapseRepeatedPhrases(stripSpeechFormatting(text))
+        stripSpeechFormatting(text)
 
     private fun normalizeSpeechWhitespace(text: String): String =
         text
@@ -511,15 +486,8 @@ object LlmPromptDefaults {
             .let { sanitizeMemoryParagraph(it) }
     }
 
-    fun isCannedFallback(text: String): Boolean {
-        val t = text.trim()
-        return t == DIDNT_CATCH_REPLY ||
-            t == GREETING_FALLBACK ||
-            t == STATUS_FALLBACK ||
-            t == CAPABILITY_FALLBACK ||
-            t == CURIOUS_FALLBACK ||
-            t == CLARIFY_FALLBACK
-    }
+    fun isCannedFallback(text: String): Boolean =
+        text.trim() == DIDNT_CATCH_REPLY
 
     private val EMPTY_PLACEHOLDERS = setOf(
         "none", "null", "nil", "n/a", "na", "empty", "(empty)", "[empty]",
@@ -581,7 +549,7 @@ object LlmPromptDefaults {
     )
 
     private val EMOTION_TAGS = listOf(
-        "[happy]", "[sad]", "[angry]", "[thinking]", "[idle]",
+        "[happy]", "[sad]", "[angry]", "[thinking]", "[curious]", "[idle]",
         "[listening]", "[talking]", "[sleeping]",
     )
 

@@ -37,6 +37,7 @@ import dagger.hilt.android.AndroidEntryPoint
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import javax.inject.Inject
@@ -70,6 +71,11 @@ class PetOverlayService : Service() {
     private val petScreenLoc = IntArray(2)
     private val chromePositionListener = ViewTreeObserver.OnGlobalLayoutListener { syncChromePosition() }
     private var closeDragHintView: ComposeView? = null
+    private var usageNudgeScrimView: ComposeView? = null
+    /** True while a usage-nudge scrim is up; cleared when speak ends or user taps scrim. */
+    private var usageNudgeAttentionActive = false
+    /** True after a successful mic FGS promote (requires foreground-eligible start). */
+    private var microphoneForegroundActive = false
 
     override fun onCreate() {
         super.onCreate()
@@ -110,11 +116,38 @@ class PetOverlayService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action == ACTION_TRIGGER_AI) {
-            if (::petViewModel.isInitialized) {
-                petViewModel.onPetTapped()
-            } else {
-                Log.w(TAG, "TRIGGER_AI before ViewModel ready")
+        when (intent?.action) {
+            ACTION_TRIGGER_AI -> {
+                // Mic FGS is only eligible after a user-visible activity (AiTriggerActivity).
+                promoteToMicrophoneForeground()
+                if (::petViewModel.isInitialized) {
+                    petViewModel.onPetTapped()
+                } else {
+                    Log.w(TAG, "TRIGGER_AI before ViewModel ready")
+                }
+            }
+            ACTION_USAGE_NUDGE -> {
+                val appLabel = intent.getStringExtra(EXTRA_NUDGE_APP_LABEL)
+                    ?.trim()
+                    .orEmpty()
+                    .ifBlank { "that app" }
+                val minutes = intent.getIntExtra(EXTRA_NUDGE_MINUTES, 0).coerceAtLeast(1)
+                val message = intent.getStringExtra(EXTRA_NUDGE_MESSAGE)
+                    ?.trim()
+                    .orEmpty()
+                    .ifBlank {
+                        "You've been on $appLabel for about $minutes minutes — want a quick break with me?"
+                    }
+                serviceScope.launch {
+                    presentUsageNudgeAttention()
+                    // Fresh overlay may still be loading TTS — wait briefly then speak.
+                    delay(800)
+                    if (::petViewModel.isInitialized) {
+                        petViewModel.speakProactive(message)
+                    } else {
+                        Log.w(TAG, "USAGE_NUDGE before ViewModel ready")
+                    }
+                }
             }
         }
         // Do not clear mid-session chat on every non-trigger start (e.g. Start Pet while
@@ -131,22 +164,50 @@ class PetOverlayService : Service() {
         return ViewModelProvider(lifecycleOwner, factory)[PetViewModel::class.java]
     }
 
+    /**
+     * Overlay may be started from the background (usage nudge). Android 14+ rejects
+     * microphone FGS from a background start, so boot without mic and promote later.
+     */
     private fun startAsForeground() {
-        val notification = buildNotification()
-        val types = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE or
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK or
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
-        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE or
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
-        } else {
-            0
+        startForegroundWithTypes(includeMicrophone = false)
+    }
+
+    private fun promoteToMicrophoneForeground() {
+        if (microphoneForegroundActive) return
+        runCatching {
+            startForegroundWithTypes(includeMicrophone = true)
+            microphoneForegroundActive = true
+        }.onFailure { e ->
+            Log.e(TAG, "Could not promote overlay FGS to microphone", e)
         }
+    }
+
+    private fun startForegroundWithTypes(includeMicrophone: Boolean) {
+        val notification = buildNotification()
+        val types = foregroundServiceTypes(includeMicrophone)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && types != 0) {
             startForeground(NOTIFICATION_ID, notification, types)
         } else {
             startForeground(NOTIFICATION_ID, notification)
+        }
+    }
+
+    private fun foregroundServiceTypes(includeMicrophone: Boolean): Int {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            var types = ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK or
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+            if (includeMicrophone) {
+                types = types or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+            }
+            types
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            var types = ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
+            if (includeMicrophone) {
+                types = types or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+            }
+            types
+        } else {
+            0
         }
     }
 
@@ -233,7 +294,11 @@ class PetOverlayService : Service() {
                 updateChromeWindowVisibility(state)
                 val busy = state !is OverlayState.Idle
                 if (wasBusy && !busy) {
+                    // Conversation session ended (listen timeout, tap-while-listening, or dismiss).
                     AiTriggerActivity.finishIfShowing()
+                    if (usageNudgeAttentionActive) {
+                        hideUsageNudgeScrim()
+                    }
                 }
                 wasBusy = busy
             }
@@ -243,8 +308,113 @@ class PetOverlayService : Service() {
         chromeOverlayView?.viewTreeObserver?.addOnGlobalLayoutListener(chromePositionListener)
     }
 
+    private fun presentUsageNudgeAttention() {
+        usageNudgeAttentionActive = true
+        uiFeedback.usageNudgeAttention()
+        showUsageNudgeScrim()
+        centerPetOnScreen()
+    }
+
+    private fun showUsageNudgeScrim() {
+        if (usageNudgeScrimView != null) return
+        if (!::windowManager.isInitialized) return
+        val scrim = ComposeView(this).apply {
+            setViewTreeLifecycleOwner(lifecycleOwner)
+            setViewTreeViewModelStoreOwner(lifecycleOwner)
+            setViewTreeSavedStateRegistryOwner(lifecycleOwner)
+            setContent {
+                OverlayUsageNudgeScrim(onDismiss = { hideUsageNudgeScrim() })
+            }
+        }
+        val params = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT,
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+        }
+        try {
+            // Add under pet/chrome by inserting then re-stacking the pet layers on top.
+            windowManager.addView(scrim, params)
+            usageNudgeScrimView = scrim
+            restackPetAboveScrim()
+        } catch (e: Exception) {
+            Log.w(TAG, "show usage nudge scrim", e)
+            usageNudgeScrimView = null
+        }
+    }
+
+    private fun restackPetAboveScrim() {
+        val pet = petOverlayView
+        val chrome = chromeOverlayView
+        if (pet != null && ::petLayoutParams.isInitialized) {
+            try {
+                windowManager.removeView(pet)
+                windowManager.addView(pet, petLayoutParams)
+            } catch (e: Exception) {
+                Log.w(TAG, "restack pet above scrim", e)
+            }
+        }
+        if (chrome != null && ::chromeLayoutParams.isInitialized) {
+            try {
+                windowManager.removeView(chrome)
+                windowManager.addView(chrome, chromeLayoutParams)
+            } catch (e: Exception) {
+                Log.w(TAG, "restack chrome above scrim", e)
+            }
+        }
+    }
+
+    private fun hideUsageNudgeScrim() {
+        usageNudgeAttentionActive = false
+        usageNudgeScrimView?.let { v ->
+            try {
+                windowManager.removeView(v)
+            } catch (e: Exception) {
+                Log.w(TAG, "remove usage nudge scrim", e)
+            }
+            usageNudgeScrimView = null
+        }
+    }
+
+    private fun centerPetOnScreen() {
+        val pet = petOverlayView ?: return
+        if (!::petLayoutParams.isInitialized) return
+        pet.post {
+            val w = if (pet.width > 0) pet.width else pet.measuredWidth
+            val h = if (pet.height > 0) pet.height else pet.measuredHeight
+            if (w <= 0 || h <= 0) {
+                pet.post { centerPetOnScreen() }
+                return@post
+            }
+            val sw = screenWidthPx()
+            val sh = screenHeightPx()
+            petLayoutParams.x = ((sw - w) / 2).coerceAtLeast(0)
+            petLayoutParams.y = ((sh - h) / 2).coerceAtLeast(0)
+            try {
+                windowManager.updateViewLayout(pet, petLayoutParams)
+                syncChromePosition()
+            } catch (e: Exception) {
+                Log.w(TAG, "center pet on screen", e)
+            }
+        }
+    }
+
     private fun launchAiTriggerActivity() {
-        if (AiTriggerActivity.isShowing()) return
+        // If the trampoline is already up (e.g. stuck after a failed turn), re-fire the
+        // trigger instead of swallowing the tap.
+        if (AiTriggerActivity.isShowing()) {
+            startService(
+                Intent(this, PetOverlayService::class.java).apply {
+                    action = ACTION_TRIGGER_AI
+                },
+            )
+            return
+        }
         startActivity(
             Intent(this, AiTriggerActivity::class.java).apply {
                 addFlags(
@@ -304,6 +474,15 @@ class PetOverlayService : Service() {
         } else {
             @Suppress("DEPRECATION")
             resources.displayMetrics.heightPixels
+        }
+
+    private fun screenWidthPx(): Int =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val wm = getSystemService(WINDOW_SERVICE) as WindowManager
+            wm.currentWindowMetrics.bounds.width()
+        } else {
+            @Suppress("DEPRECATION")
+            resources.displayMetrics.widthPixels
         }
 
     private fun showCloseDragHint() {
@@ -368,6 +547,7 @@ class PetOverlayService : Service() {
             petViewModel.cleanup()
         }
         hideCloseDragHint()
+        hideUsageNudgeScrim()
         chromeOverlayView?.viewTreeObserver?.let { obs ->
             if (obs.isAlive) {
                 obs.removeOnGlobalLayoutListener(chromePositionListener)
@@ -412,6 +592,10 @@ class PetOverlayService : Service() {
 
     companion object {
         const val ACTION_TRIGGER_AI = "com.kawaiipet.app.action.TRIGGER_AI"
+        const val ACTION_USAGE_NUDGE = "com.kawaiipet.app.action.USAGE_NUDGE"
+        const val EXTRA_NUDGE_MESSAGE = "nudge_message"
+        const val EXTRA_NUDGE_APP_LABEL = "nudge_app_label"
+        const val EXTRA_NUDGE_MINUTES = "nudge_minutes"
 
         private const val TAG = "PetOverlayService"
         private const val NOTIFICATION_ID = 1

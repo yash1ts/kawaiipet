@@ -31,6 +31,7 @@ import androidx.navigation.NavController
 import com.kawaiipet.app.R
 import com.kawaiipet.app.assets.RequiredAssets
 import com.kawaiipet.app.audio.DefaultVoiceModels
+import com.kawaiipet.app.audio.VadEngineConfig
 import com.kawaiipet.app.util.PreferenceManager
 import dagger.hilt.android.lifecycle.HiltViewModel
 import javax.inject.Inject
@@ -42,8 +43,12 @@ class SettingsViewModel @Inject constructor(
 ) : ViewModel() {
     val ttsVolume = prefs.ttsVolume
     val ttsSpeed = prefs.ttsSpeed
+    val vadThreshold = prefs.vadThreshold
+    val vadMinSilenceSec = prefs.vadMinSilenceSec
     suspend fun setVolume(value: Float) = prefs.setTtsVolume(value)
     suspend fun setSpeed(value: Float) = prefs.setTtsSpeed(value)
+    suspend fun setVadThreshold(value: Float) = prefs.setVadThreshold(value)
+    suspend fun setVadMinSilenceSec(value: Float) = prefs.setVadMinSilenceSec(value)
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -57,6 +62,12 @@ fun SettingsScreen(
     )
     val speed by viewModel.ttsSpeed.collectAsState(
         initial = PreferenceManager.TTS_SPEED_DEFAULT,
+    )
+    val vadThreshold by viewModel.vadThreshold.collectAsState(
+        initial = VadEngineConfig.THRESHOLD,
+    )
+    val vadSilence by viewModel.vadMinSilenceSec.collectAsState(
+        initial = VadEngineConfig.MIN_SILENCE_SEC,
     )
     val scope = rememberCoroutineScope()
 
@@ -139,6 +150,76 @@ fun SettingsScreen(
                 },
                 valueRange = PreferenceManager.TTS_SPEED_MIN..PreferenceManager.TTS_SPEED_MAX,
                 steps = ((PreferenceManager.TTS_SPEED_MAX - PreferenceManager.TTS_SPEED_MIN) * 10f).toInt() - 1,
+            )
+
+            Spacer(modifier = Modifier.height(24.dp))
+            Text(
+                text = stringResource(R.string.settings_listening_section),
+                style = MaterialTheme.typography.titleMedium,
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(
+                text = stringResource(R.string.vad_threshold_label),
+                style = MaterialTheme.typography.labelLarge,
+            )
+            Text(
+                text = stringResource(
+                    R.string.vad_threshold_value,
+                    String.format("%.2f", vadThreshold),
+                ),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Text(
+                text = stringResource(R.string.vad_threshold_hint),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Slider(
+                value = vadThreshold.coerceIn(
+                    VadEngineConfig.THRESHOLD_MIN,
+                    VadEngineConfig.THRESHOLD_MAX,
+                ),
+                onValueChange = { v ->
+                    val snapped = (kotlin.math.round(v * 20f) / 20f)
+                        .coerceIn(VadEngineConfig.THRESHOLD_MIN, VadEngineConfig.THRESHOLD_MAX)
+                    scope.launch { viewModel.setVadThreshold(snapped) }
+                },
+                valueRange = VadEngineConfig.THRESHOLD_MIN..VadEngineConfig.THRESHOLD_MAX,
+            )
+
+            Spacer(modifier = Modifier.height(16.dp))
+            Text(
+                text = stringResource(R.string.vad_silence_label),
+                style = MaterialTheme.typography.labelLarge,
+            )
+            Text(
+                text = stringResource(
+                    R.string.vad_silence_value,
+                    String.format("%.2f", vadSilence),
+                ),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Text(
+                text = stringResource(R.string.vad_silence_hint),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Slider(
+                value = vadSilence.coerceIn(
+                    VadEngineConfig.MIN_SILENCE_SEC_MIN,
+                    VadEngineConfig.MIN_SILENCE_SEC_MAX,
+                ),
+                onValueChange = { v ->
+                    val snapped = (kotlin.math.round(v * 20f) / 20f)
+                        .coerceIn(
+                            VadEngineConfig.MIN_SILENCE_SEC_MIN,
+                            VadEngineConfig.MIN_SILENCE_SEC_MAX,
+                        )
+                    scope.launch { viewModel.setVadMinSilenceSec(snapped) }
+                },
+                valueRange = VadEngineConfig.MIN_SILENCE_SEC_MIN..VadEngineConfig.MIN_SILENCE_SEC_MAX,
             )
 
             Spacer(modifier = Modifier.height(24.dp))

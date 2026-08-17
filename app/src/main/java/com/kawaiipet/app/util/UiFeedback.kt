@@ -74,14 +74,24 @@ class UiFeedback @Inject constructor(@ApplicationContext context: Context) {
         vibratePredefined(VibrationEffect.EFFECT_DOUBLE_CLICK, legacyMs = 40L)
     }
 
+    /** Usage-limit interrupt — stronger triple pulse + louder ack before TTS. */
+    fun usageNudgeAttention() {
+        vibrateWaveform(longArrayOf(0, 55, 70, 55, 70, 90))
+        playSystemTone(ToneGenerator.TONE_PROP_ACK, durationMs = 220, volume = NUDGE_TONE_VOLUME)
+    }
+
     private fun playSound(fxConstant: Int) {
         runCatching { audioManager?.playSoundEffect(fxConstant) }
     }
 
-    private fun playSystemTone(toneType: Int, durationMs: Int) {
+    private fun playSystemTone(
+        toneType: Int,
+        durationMs: Int,
+        volume: Int = TONE_VOLUME,
+    ) {
         mainHandler.post {
             runCatching {
-                val tg = ToneGenerator(AudioManager.STREAM_NOTIFICATION, TONE_VOLUME)
+                val tg = ToneGenerator(AudioManager.STREAM_NOTIFICATION, volume.coerceIn(0, 100))
                 tg.startTone(toneType, durationMs)
                 mainHandler.postDelayed(
                     { runCatching { tg.release() } },
@@ -124,5 +134,6 @@ class UiFeedback @Inject constructor(@ApplicationContext context: Context) {
 
     companion object {
         private const val TONE_VOLUME = 28
+        private const val NUDGE_TONE_VOLUME = 55
     }
 }

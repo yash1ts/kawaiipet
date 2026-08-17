@@ -11,7 +11,6 @@ import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
 import android.util.Log
 import kotlinx.coroutines.CompletableDeferred
-import kotlinx.coroutines.async
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.Mutex
@@ -32,7 +31,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlin.coroutines.resume
-import kotlin.math.sqrt
+import com.kawaiipet.app.pet.SessionConfigStore
+import com.kawaiipet.app.util.DebugSessionLog
 import com.kawaiipet.app.util.PreferenceManager
 
 class AudioPipeline(
@@ -43,6 +43,7 @@ class AudioPipeline(
     private val recorder: AudioRecordManager,
     private val player: AudioTrackManager,
     private val preferenceManager: PreferenceManager,
+    private val sessionConfigStore: SessionConfigStore,
 ) {
     private var recordJob: Job? = null
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -65,7 +66,10 @@ class AudioPipeline(
 
     fun initializeSTT(modelId: String): Boolean = stt.initialize(modelId)
     fun initializeTTS(modelId: String): Boolean = tts.initialize(modelId)
-    fun initializeVad(): Boolean = vad.initialize()
+    fun initializeVad(): Boolean {
+        val cfg = sessionConfigStore.snapshot()
+        return vad.initialize(cfg.vadThreshold, cfg.vadMinSilenceSec)
+    }
 
     /**
      * One discarded synth so Kitten's first real sentence isn't a cold kernel compile.
@@ -180,83 +184,58 @@ class AudioPipeline(
             Log.e(TAG, "Silero VAD required but not ready")
             return ""
         }
-        stt.startStream()
+        // Match sherpa-onnx VadAsr: Silero owns utterance bounds; Moonshine decodes
+        // completed segment PCM (not a parallel live stream gated on isSpeechDetected).
         sttInputCleaner.reset()
         vad.reset()
         if (!recorder.start()) return ""
 
-        val result = CompletableDeferred<String>()
-        var leadingSilenceChunks = 0
-        var speechChunksTotal = 0
-        var speechConfirmChunks = 0
+        val result = CompletableDeferred<List<com.k2fsa.sherpa.onnx.SpeechSegment>>()
         var hasSpeechHint = false
         var speechHintStartedAt = 0L
-        var nonSpeechChunks = 0
         val recordingStartedAt = SystemClock.elapsedRealtime()
-        val preRoll = ArrayDeque<FloatArray>(PRE_SPEECH_LOOKBACK_CHUNKS + 1)
 
         recordJob = scope.launch {
             recorder.readLoop { samples ->
+                if (result.isCompleted) return@readLoop
                 val now = SystemClock.elapsedRealtime()
                 if (now - recordingStartedAt >= MAX_RECORDING_DURATION_MS) {
                     Log.d(TAG, "Silero: max recording duration reached")
-                    finishListen(result)
+                    vad.flush()
+                    completeWithVadSegments(result)
                     return@readLoop
                 }
 
-                // Silero on ungained PCM; Moonshine on leveled PCM.
+                // Official samples: raw float PCM, no AGC (AGC confuses Silero).
                 val vadSamples = sttInputCleaner.pcm16ToFloat(samples)
-                val floatSamples = sttInputCleaner.cleanPcm16ToFloat(samples)
                 val isSpeech = vad.acceptAndIsSpeech(vadSamples)
-                // Completed Silero segments mark a clean utterance end — don't re-feed
-                // samples (already streamed live into Moonshine).
-                val segmentEnded = vad.drainSegments().isNotEmpty()
-
-                if (isSpeech) {
-                    nonSpeechChunks = 0
-                    leadingSilenceChunks = 0
-                    speechConfirmChunks++
-                    pushPreRoll(preRoll, floatSamples)
-                    if (!hasSpeechHint) {
-                        if (speechConfirmChunks >= VadEngineConfig.SPEECH_START_CONFIRM_CHUNKS) {
-                            hasSpeechHint = true
-                            speechHintStartedAt = now
-                            while (preRoll.isNotEmpty()) {
-                                stt.acceptWaveform(preRoll.removeFirst())
-                            }
-                            // Confirm chunks + lookback already fed via pre-roll.
-                            speechChunksTotal = speechConfirmChunks
-                            Log.d(TAG, "Silero: speech start confirm=$speechConfirmChunks")
-                        }
-                    } else {
-                        stt.acceptWaveform(floatSamples)
-                        speechChunksTotal++
-                    }
-                } else {
-                    speechConfirmChunks = 0
-                    if (!hasSpeechHint) {
-                        pushPreRoll(preRoll, floatSamples)
-                        leadingSilenceChunks++
-                        if (leadingSilenceChunks > LEADING_SILENCE_CHUNKS) {
-                            Log.d(TAG, "Silero: no speech")
-                            recorder.stop()
-                            result.complete("")
-                            return@readLoop
-                        }
-                    } else {
-                        nonSpeechChunks++
-                    }
+                val segments = vad.drainSegments()
+                if (segments.isNotEmpty()) {
+                    Log.d(TAG, "Silero: segment ready count=${segments.size}")
+                    DebugSessionLog.log(
+                        hypothesisId = "VAD",
+                        location = "AudioPipeline.vadEndpoint",
+                        message = "segment ready",
+                        data = mapOf(
+                            "count" to segments.size,
+                            "elapsedMs" to (now - recordingStartedAt),
+                        ),
+                    )
+                    recorder.stop()
+                    result.complete(segments)
+                    return@readLoop
                 }
 
-                if (hasSpeechHint && speechChunksTotal >= MIN_SPEECH_CHUNKS_BEFORE_END &&
-                    (segmentEnded || nonSpeechChunks > VadEngineConfig.SILENCE_END_CHUNKS)
-                ) {
-                    Log.d(
-                        TAG,
-                        "Silero: end segment=$segmentEnded silence=$nonSpeechChunks " +
-                            "voiced=$speechChunksTotal",
-                    )
-                    finishListen(result)
+                if (isSpeech) {
+                    if (!hasSpeechHint) {
+                        hasSpeechHint = true
+                        speechHintStartedAt = now
+                        Log.d(TAG, "Silero: speech detected")
+                    }
+                } else if (!hasSpeechHint && now - recordingStartedAt >= LEADING_SILENCE_MS) {
+                    Log.d(TAG, "Silero: no speech")
+                    recorder.stop()
+                    result.complete(emptyList())
                     return@readLoop
                 }
 
@@ -264,42 +243,67 @@ class AudioPipeline(
                     now - speechHintStartedAt >= MAX_UTTERANCE_AFTER_SPEECH_MS
                 ) {
                     Log.d(TAG, "Silero: max utterance length reached")
-                    finishListen(result)
+                    vad.flush()
+                    completeWithVadSegments(result)
                     return@readLoop
                 }
             }
         }
 
-        val awaited = withTimeoutOrNull(timeoutMs) { result.await() }
-        val textDeferred = scope.async(Dispatchers.Default) {
-            awaited ?: finalizeSherpaTranscript()
+        val segs = withTimeoutOrNull(timeoutMs) { result.await() } ?: run {
+            Log.w(TAG, "Silero: listen timed out")
+            vad.flush()
+            vad.drainSegments()
         }
         recorder.stop()
         recordJob?.cancelAndJoin()
-        val text = textDeferred.await()
-
-        stt.endStream()
-        return text.trim()
+        return transcribeVadSegments(segs).trim()
     }
 
-    private fun pushPreRoll(preRoll: ArrayDeque<FloatArray>, chunk: FloatArray) {
-        preRoll.addLast(chunk)
-        while (preRoll.size > PRE_SPEECH_LOOKBACK_CHUNKS) {
-            preRoll.removeFirst()
-        }
-    }
-
-    /** Pad a short silence tail, then decode — offline ASR often drops final phones without it. */
-    private fun finalizeSherpaTranscript(): String {
-        val pad = FloatArray(TRAILING_PAD_SAMPLES)
-        stt.acceptWaveform(pad)
-        return stt.getFinalResult()
-    }
-
-    private fun finishListen(result: CompletableDeferred<String>) {
+    private fun completeWithVadSegments(
+        result: CompletableDeferred<List<com.k2fsa.sherpa.onnx.SpeechSegment>>,
+    ) {
         if (result.isCompleted) return
         recorder.stop()
-        result.complete(finalizeSherpaTranscript())
+        result.complete(vad.drainSegments())
+    }
+
+    /**
+     * Decode Silero speech segments with Moonshine (sherpa-onnx VadAsr pattern).
+     * RMS-levels for ASR only, with a noise-floor guard so we don't boost hush.
+     */
+    private fun transcribeVadSegments(segments: List<com.k2fsa.sherpa.onnx.SpeechSegment>): String {
+        if (segments.isEmpty()) return ""
+        val decodeStarted = SystemClock.elapsedRealtime()
+        stt.startStream()
+        return try {
+            var totalSamples = 0
+            for (segment in segments) {
+                val raw = segment.samples
+                if (raw.isEmpty()) continue
+                totalSamples += raw.size
+                stt.acceptWaveform(sttInputCleaner.levelFloatForAsr(raw))
+            }
+            val pad = FloatArray(TRAILING_PAD_SAMPLES)
+            stt.acceptWaveform(pad)
+            val text = stt.getFinalResult().trim()
+            val ms = totalSamples * 1000L / SttEngineConfig.SAMPLE_RATE
+            val decodeMs = SystemClock.elapsedRealtime() - decodeStarted
+            Log.i(TAG, "Moonshine decode samples=$totalSamples (~${ms}ms audio, ${decodeMs}ms) text='${text.take(120)}'")
+            DebugSessionLog.log(
+                hypothesisId = "ASR",
+                location = "AudioPipeline.transcribeVadSegments",
+                message = "moonshine decode",
+                data = mapOf(
+                    "audioMs" to ms,
+                    "decodeMs" to decodeMs,
+                    "textLen" to text.length,
+                ),
+            )
+            text
+        } finally {
+            stt.endStream()
+        }
     }
 
     private suspend fun listenWithPlatformSpeechRecognizer(
@@ -319,11 +323,11 @@ class AudioPipeline(
                     // detection — this silence window delays every response.
                     putExtra(
                         RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS,
-                        1_400L
+                        800L
                     )
                     putExtra(
                         RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS,
-                        1_100L
+                        600L
                     )
                 }
 
@@ -444,7 +448,7 @@ class AudioPipeline(
                     if (hasSpeechStarted) nonSpeechChunks++
                 }
 
-                if (hasSpeechStarted && speechChunksTotal >= MIN_SPEECH_CHUNKS_BEFORE_END &&
+                if (hasSpeechStarted && speechChunksTotal >= 5 &&
                     (segmentEnded || nonSpeechChunks > VadEngineConfig.SILENCE_END_CHUNKS)
                 ) {
                     Log.d(TAG, "Silero: silence after speech, stopping")
@@ -509,11 +513,17 @@ class AudioPipeline(
                                 ) ?: continue
                                 if (samples.isEmpty()) continue
                                 if (index == 0) {
+                                    val firstAudioMs = SystemClock.elapsedRealtime() - t0
                                     Log.i(
                                         TAG,
                                         "Sherpa TTS first audio chunk after " +
-                                            "${SystemClock.elapsedRealtime() - t0}ms " +
-                                            "(streaming with LLM)",
+                                            "${firstAudioMs}ms (streaming with LLM)",
+                                    )
+                                    DebugSessionLog.log(
+                                        hypothesisId = "TTS",
+                                        location = "AudioPipeline.speakSentences",
+                                        message = "first audio chunk",
+                                        data = mapOf("firstAudioMs" to firstAudioMs),
                                     )
                                 }
                                 index++
@@ -594,19 +604,13 @@ class AudioPipeline(
         /** Default wall-clock budget for listen (must allow [MAX_RECORDING_DURATION_MS] to elapse). */
         private const val DEFAULT_LISTEN_TIMEOUT_MS = 35_000L
 
-        /** Don't cut off until we've heard ~500ms of voiced audio. */
-        private const val MIN_SPEECH_CHUNKS_BEFORE_END = 5
+        /** ~32ms chunks — 30s of leading silence with no voiced audio ends the listen. */
+        private const val LEADING_SILENCE_MS = 30_000L
 
-        /** Keep ~400ms before VAD speech-start so first phonemes aren't clipped for offline ASR. */
-        private const val PRE_SPEECH_LOOKBACK_CHUNKS = 4
+        /** Hard stop after speech was detected. */
+        private const val MAX_UTTERANCE_AFTER_SPEECH_MS = 12_000L
 
         /** ~250ms of zeros appended before offline decode. */
         private const val TRAILING_PAD_SAMPLES = SttEngineConfig.SAMPLE_RATE / 4
-
-        /** ~100ms per chunk — 100 ≈ 10s with no voiced audio. */
-        private const val LEADING_SILENCE_CHUNKS = 100
-
-        /** Hard stop after speech was detected. */
-        private const val MAX_UTTERANCE_AFTER_SPEECH_MS = 10_000L
     }
 }

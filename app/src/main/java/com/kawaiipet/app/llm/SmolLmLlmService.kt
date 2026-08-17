@@ -11,6 +11,7 @@ import com.google.ai.edge.litertlm.NoRepeatNgramConfig
 import com.google.ai.edge.litertlm.RepetitionPenaltyConfig
 import com.google.ai.edge.litertlm.SamplerConfig
 import com.kawaiipet.app.pet.SessionConfigStore
+import com.kawaiipet.app.util.DebugSessionLog
 import com.kawaiipet.app.util.PreferenceManager
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -21,11 +22,9 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
 /**
- * Qwen3-0.6B INT4 (no-think) via LiteRT-LM for multi-turn pet chat:
- * - Sticky conversation + KV cache (multi-turn TTFT win)
- * - No-think artifact (empty think block baked in — no CoT to strip)
- * - Streams sanitized tokens to UI/TTS as they arrive
- * - Per-turn repetition / n-gram penalties for short pet replies
+ * LFM2.5-1.2B-Instruct INT4 via LiteRT-LM for pet chat.
+ * History is ChatML roles (`Message.user` / `Message.model`); the .litertlm
+ * file applies LFM2.5's Jinja template (`<|im_start|>user` / `assistant`).
  */
 @Singleton
 class SmolLmLlmService @Inject constructor(
@@ -73,18 +72,31 @@ class SmolLmLlmService @Inject constructor(
         val engine = smolLm.ensureReady()
         val latestUser = messages.lastOrNull { it.role == Role.USER }?.text?.trim().orEmpty()
             .take(LlmPromptDefaults.MAX_CHARS_PER_TURN)
+        val cfg = sessionConfigStore.snapshot()
+        val petName = cfg.petName.ifBlank { prefs.getPetName() }
         val systemPrompt = currentSystemPrompt()
 
         val prior = messages.dropLast(1)
         val promptUser = if (LlmPromptDefaults.PURE_SMOLLM_DEBUG) {
             latestUser
         } else {
-            LlmPromptDefaults.attachMemoryToUserTurn(latestUser, memoryParagraph)
+            LlmPromptDefaults.formatLiveUserTurn(
+                latestUser = latestUser,
+                priorMessages = prior,
+                memoryParagraph = memoryParagraph,
+                petName = petName,
+            )
+        }
+        // LFM2.5 ChatML: prior turns as user/assistant messages so Jinja labels them.
+        val litertHistory = if (LlmPromptDefaults.PURE_SMOLLM_DEBUG) {
+            emptyList()
+        } else {
+            prior
         }
 
         Log.d(
             TAG,
-            "chat model=Qwen3-0.6B-nothink systemLen=${systemPrompt.length} " +
+            "chat model=LFM2.5-1.2B-Instruct systemLen=${systemPrompt.length} " +
                 "memoryLen=${memoryParagraph.length} prior=${prior.size} " +
                 "latestLen=${latestUser.length} " +
                 "promptUser=${promptUser.take(160).toOneLineLog()}",
@@ -95,9 +107,10 @@ class SmolLmLlmService @Inject constructor(
             var text = generateOnceLocked(
                 engine = engine,
                 systemPrompt = systemPrompt,
-                priorMessages = prior,
+                priorMessages = litertHistory,
                 promptUser = promptUser,
                 reuseSticky = true,
+                applyPenalties = true,
                 onPartial = onPartial,
             )
             // Only retry a truly empty generation — trust the model otherwise.
@@ -107,15 +120,62 @@ class SmolLmLlmService @Inject constructor(
                 text = generateOnceLocked(
                     engine = engine,
                     systemPrompt = systemPrompt,
-                    priorMessages = prior,
+                    priorMessages = litertHistory,
                     promptUser = promptUser,
                     reuseSticky = false,
+                    applyPenalties = true,
                     onPartial = onPartial,
                 )
+            }
+            // GPU + penalties sometimes fail with logits-shape errors; retry without them first.
+            if (text.isBlank() && lastGenerateWasLogitsError && lastGenerateUsedPenalties) {
+                Log.w(TAG, "Retrying chat without decode penalties after logits error")
+                closeStickyLocked("logits_no_penalty_retry")
+                lastGenerateWasLogitsError = false
+                text = generateOnceLocked(
+                    engine = engine,
+                    systemPrompt = systemPrompt,
+                    priorMessages = litertHistory,
+                    promptUser = promptUser,
+                    reuseSticky = false,
+                    applyPenalties = false,
+                    onPartial = onPartial,
+                )
+            }
+            // Still failing: rebuild on CPU once.
+            if (text.isBlank() && lastGenerateWasLogitsError) {
+                Log.w(TAG, "Retrying chat on CPU after logits error (was ${smolLm.currentBackendName()})")
+                closeStickyLocked("logits_cpu_fallback")
+                lastGenerateWasLogitsError = false
+                val cpuEngine = runCatching { smolLm.recreateOnCpu() }.getOrNull()
+                if (cpuEngine != null) {
+                    text = generateOnceLocked(
+                        engine = cpuEngine,
+                        systemPrompt = systemPrompt,
+                        priorMessages = litertHistory,
+                        promptUser = promptUser,
+                        reuseSticky = false,
+                        applyPenalties = true,
+                        onPartial = onPartial,
+                    )
+                }
+            }
+            if (text.isNotBlank()) {
+                lastGenerateWasLogitsError = false
             }
             text
         }
     }
+
+    @Volatile
+    private var lastGenerateWasLogitsError = false
+
+    @Volatile
+    private var lastGenerateUsedPenalties = false
+
+    /** GPU constrained-decode penalties crashed once — skip them on GPU after that. */
+    @Volatile
+    private var penaltiesUnsafeOnGpu = false
 
     private suspend fun generateOnceLocked(
         engine: com.google.ai.edge.litertlm.Engine,
@@ -123,6 +183,7 @@ class SmolLmLlmService @Inject constructor(
         priorMessages: List<ChatMessage>,
         promptUser: String,
         reuseSticky: Boolean,
+        applyPenalties: Boolean,
         onPartial: suspend (String) -> Unit,
     ): String {
         val conversation = if (reuseSticky) {
@@ -134,8 +195,9 @@ class SmolLmLlmService @Inject constructor(
                 priorMessages = priorMessages,
             )
         }
+        val (repPenalty, ngram) = if (applyPenalties) decodePenaltyConfigs() else null to null
+        lastGenerateUsedPenalties = repPenalty != null || ngram != null
         val startedAt = SystemClock.elapsedRealtime()
-        var keepSticky = reuseSticky
         return try {
             var rawAll = ""
             var contentFromMessage = ""
@@ -144,8 +206,8 @@ class SmolLmLlmService @Inject constructor(
 
             conversation.sendMessageAsync(
                 promptUser,
-                repetitionPenaltyConfig = petRepetitionPenaltyConfig(),
-                noRepeatNgramConfig = petNoRepeatNgramConfig(),
+                repetitionPenaltyConfig = repPenalty,
+                noRepeatNgramConfig = ngram,
             ).collect { message ->
                 val contentPiece = primaryContentText(message)
                 contentFromMessage = mergeStreamText(contentFromMessage, contentPiece)
@@ -160,10 +222,21 @@ class SmolLmLlmService @Inject constructor(
                     lastSpoken = spoken
                     if (!firstSpokenLogged) {
                         firstSpokenLogged = true
+                        val ttft = SystemClock.elapsedRealtime() - startedAt
                         Log.i(
                             TAG,
-                            "first spoken text after ${SystemClock.elapsedRealtime() - startedAt}ms " +
+                            "first spoken text after ${ttft}ms " +
                                 "spoken=${spoken.take(80).toOneLineLog()} reuseSticky=$reuseSticky",
+                        )
+                        DebugSessionLog.log(
+                            hypothesisId = "LLM",
+                            location = "SmolLmLlmService.ttft",
+                            message = "first spoken text",
+                            data = mapOf(
+                                "ttftMs" to ttft,
+                                "reuseSticky" to reuseSticky,
+                                "backend" to smolLm.currentBackendName(),
+                            ),
                         )
                     }
                     onPartial(spoken)
@@ -176,43 +249,75 @@ class SmolLmLlmService @Inject constructor(
             ).orEmpty().trim()
 
             val usable = when {
-                spokenFinal.isBlank() -> {
-                    keepSticky = false
-                    ""
-                }
+                spokenFinal.isBlank() -> ""
                 else -> {
                     Log.i(
                         TAG,
-                        "llm done sticky=$keepSticky " +
+                        "llm done sticky=$reuseSticky backend=${smolLm.currentBackendName()} " +
                             "contentLen=${contentFromMessage.length} rawLen=${rawAll.length} " +
                             "spokenLen=${spokenFinal.length} " +
                             "spoken=${spokenFinal.take(120).toOneLineLog()}",
                     )
                     logBenchmark(startedAt, spokenFinal.length, rawAll.length)
-                    if (keepSticky && stickyConversation === conversation) {
-                        stickyTurnCount += 1
-                        stickyTokenEstimate += estimateTokens(promptUser) + estimateTokens(spokenFinal)
-                    }
                     spokenFinal
                 }
             }
+            if (usable.isNotBlank() && stickyConversation === conversation) {
+                stickyTurnCount++
+                stickyTokenEstimate += estimateTokens(promptUser) + estimateTokens(usable)
+            }
             usable
         } catch (e: CancellationException) {
-            keepSticky = false
+            if (stickyConversation === conversation) {
+                closeStickyLocked("cancelled")
+            }
             throw e
         } catch (t: Throwable) {
             Log.e(TAG, "generateOnce failed", t)
-            keepSticky = false
-            ""
-        } finally {
-            if (!keepSticky) {
-                if (stickyConversation === conversation) {
-                    closeStickyLocked("ephemeral_or_bad")
-                } else {
-                    runCatching { conversation.close() }
+            if (stickyConversation === conversation) {
+                closeStickyLocked("generate_failed")
+            }
+            if (isLogitsDimensionError(t)) {
+                lastGenerateWasLogitsError = true
+                if (lastGenerateUsedPenalties && isGpuBackend()) {
+                    penaltiesUnsafeOnGpu = true
+                    Log.w(TAG, "Disabling decode penalties on GPU after logits-shape error")
                 }
             }
+            ""
+        } finally {
+            // Keep sticky ChatML conversation for the next turn. Throwaway retries close.
+            if (stickyConversation !== conversation) {
+                runCatching { conversation.close() }
+            }
         }
+    }
+
+    private fun isGpuBackend(): Boolean =
+        smolLm.currentBackendName().orEmpty().contains("GPU", ignoreCase = true)
+
+    private fun decodePenaltyConfigs(): Pair<RepetitionPenaltyConfig?, NoRepeatNgramConfig?> {
+        // GPU + constrained decode hits a logits-shape error; skip instead of
+        // crashing the first turn and then running the rest with no penalties.
+        if (isGpuBackend() || penaltiesUnsafeOnGpu) {
+            return null to null
+        }
+        val cfg = sessionConfigStore.snapshot()
+        return RepetitionPenaltyConfig(
+            repetitionPenalty = cfg.repetitionPenalty,
+            presencePenalty = cfg.presencePenalty,
+            frequencyPenalty = cfg.frequencyPenalty,
+            windowSize = LlmPromptDefaults.PENALTY_WINDOW_SIZE,
+        ) to NoRepeatNgramConfig(
+            noRepeatNgramSize = cfg.noRepeatNgramSize,
+            windowSize = LlmPromptDefaults.NO_REPEAT_NGRAM_WINDOW,
+        )
+    }
+
+    private fun isLogitsDimensionError(t: Throwable): Boolean {
+        val msg = t.message.orEmpty()
+        return msg.contains("Logits dimensions", ignoreCase = true) ||
+            msg.contains("batch_size, 1, vocab_size", ignoreCase = true)
     }
 
     private fun estimateTokens(text: String): Int =
@@ -281,12 +386,16 @@ class SmolLmLlmService @Inject constructor(
         Log.d(TAG, "Closed sticky ($reason)")
     }
 
-    /** Sanitize and forward streamed text; trust the model content. */
+    /** Incremental strip while streaming; full sanitize only on the finalized reply. */
     private fun spokenAnswerForStream(
         contentOnly: String,
         finalized: Boolean,
     ): String? {
-        val spoken = LlmPromptDefaults.sanitizeModelSpeech(contentOnly).trim()
+        val spoken = if (finalized) {
+            LlmPromptDefaults.sanitizeModelSpeech(contentOnly)
+        } else {
+            LlmPromptDefaults.sanitizeModelSpeechIncremental(contentOnly)
+        }.trim()
         if (spoken.isEmpty()) return if (finalized) "" else null
         if (!finalized && spoken.length < 2) return null
         return spoken
@@ -308,7 +417,9 @@ class SmolLmLlmService @Inject constructor(
                 .take(LlmPromptDefaults.MAX_CHARS_PER_TURN)
             if (text.isEmpty()) continue
             when (msg.role) {
-                Role.USER -> history += Message.user(text)
+                Role.USER -> {
+                    if (text.isNotEmpty()) history += Message.user(text)
+                }
                 Role.ASSISTANT -> history += Message.model(text)
             }
         }
@@ -316,6 +427,8 @@ class SmolLmLlmService @Inject constructor(
             topK = topK,
             topP = topP,
             temperature = temperature,
+            // Fresh seed each conversation so short pet turns don't collapse to the same reply.
+            seed = (System.nanoTime() and 0x7FFFFFFF).toInt(),
         )
         val config = ConversationConfig(
             systemInstruction = Contents.of(systemPrompt),
@@ -327,24 +440,10 @@ class SmolLmLlmService @Inject constructor(
         Log.i(
             TAG,
             "Created conversation history=${history.size} " +
-                "maxOut=$maxOutputTokens temp=$temperature topP=$topP topK=$topK",
+                "maxOut=$maxOutputTokens temp=$temperature topP=$topP topK=$topK seed=${sampler.seed}",
         )
         return engine.createConversation(config)
     }
-
-    private fun petRepetitionPenaltyConfig(): RepetitionPenaltyConfig =
-        RepetitionPenaltyConfig(
-            repetitionPenalty = LlmPromptDefaults.REPETITION_PENALTY,
-            presencePenalty = LlmPromptDefaults.PRESENCE_PENALTY,
-            frequencyPenalty = LlmPromptDefaults.FREQUENCY_PENALTY,
-            windowSize = LlmPromptDefaults.PENALTY_WINDOW_SIZE,
-        )
-
-    private fun petNoRepeatNgramConfig(): NoRepeatNgramConfig =
-        NoRepeatNgramConfig(
-            noRepeatNgramSize = LlmPromptDefaults.NO_REPEAT_NGRAM_SIZE,
-            windowSize = LlmPromptDefaults.NO_REPEAT_NGRAM_WINDOW,
-        )
 
     private fun primaryContentText(message: Message): String {
         val fromContents = message.contents.contents
@@ -384,7 +483,7 @@ class SmolLmLlmService @Inject constructor(
 
     companion object {
         private const val TAG = "SmolLmLlmService"
-        /** Must match [SmolLmAvailability] engine maxNumTokens (ekv1280). */
+        /** Must match [SmolLmAvailability] engine maxNumTokens. */
         private const val KV_TOKEN_BUDGET = 1280
         /** Rebuild sticky before filling the KV budget. */
         private const val STICKY_BUDGET_FRACTION = 0.65f

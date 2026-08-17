@@ -22,6 +22,7 @@ enum class PetExpression(
             "sad" -> SAD
             "angry" -> ANGRY
             "thinking" -> THINKING
+            "curious" -> THINKING
             "talking" -> TALKING
             "sleeping" -> SLEEPING
             "listening" -> LISTENING

@@ -30,12 +30,14 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 
 /**
- * Owns one pet conversation turn at a time.
+ * Owns one pet conversation session (listen → think → speak loop until idle).
  * Sticky KV stays the hot path; short-term memory is the source of truth for rebuilds.
  */
 @Singleton
@@ -61,51 +63,88 @@ class PetBrain @Inject constructor(
     private val _listeningSubtitle = MutableStateFlow("")
     val listeningSubtitle: StateFlow<String> = _listeningSubtitle.asStateFlow()
 
+    private var sessionJob: Job? = null
     private var turnJob: Job? = null
     private var mouthAnimJob: Job? = null
     private var warmUpJob: Job? = null
 
     fun onTrigger() {
-        val current = _state.value
-        when (current) {
+        uiFeedback.click()
+        when (_state.value) {
+            PetTurnState.Idle -> startSession()
+            PetTurnState.Listening,
+            PetTurnState.Preparing,
+            -> endSession()
+            is PetTurnState.Transcribing,
             is PetTurnState.Thinking,
             is PetTurnState.Speaking,
             is PetTurnState.Settling,
-            is PetTurnState.Preparing,
-            is PetTurnState.Listening,
-            is PetTurnState.Transcribing,
-            -> {
-                uiFeedback.click()
-                cancelTurn()
-                return
-            }
-            PetTurnState.Idle -> Unit
+            -> interruptToListen()
         }
+    }
 
-        uiFeedback.click()
+    fun cancelTurn() = endSession()
+
+    private fun startSession() {
+        if (sessionJob?.isActive == true) return
         warmUpLlmInBackground()
-        turnJob?.cancel()
-        turnJob = scope.launch {
-            val trace = TurnTrace()
+        sessionJob = scope.launch {
+            var firstTurn = true
             try {
-                runTurn(trace)
-            } catch (e: CancellationException) {
+                while (isActive) {
+                    val capturedFirst = firstTurn
+                    firstTurn = false
+                    var endSession = false
+                    val turn = launch {
+                        val trace = TurnTrace()
+                        try {
+                            when (runOneTurn(firstTurn = capturedFirst, trace = trace)) {
+                                TurnOutcome.EndSession -> endSession = true
+                                TurnOutcome.Continue -> Unit
+                            }
+                        } catch (e: CancellationException) {
+                            audioPipeline.stopListening()
+                            audioPipeline.stopSpeaking()
+                            throw e
+                        } catch (e: Exception) {
+                            Log.e(TAG, "turn failed", e)
+                            recoverWithFriendlyFallback()
+                        } finally {
+                            trace.log()
+                        }
+                    }
+                    turnJob = turn
+                    turn.join()
+                    turnJob = null
+                    if (endSession || !isActive) break
+                }
+            } finally {
                 audioPipeline.stopListening()
                 audioPipeline.stopSpeaking()
-                returnToIdle()
-                throw e
-            } catch (e: Exception) {
-                Log.e(TAG, "turn failed", e)
-                recoverWithFriendlyFallback()
-                returnToIdle()
-            } finally {
-                trace.log()
+                if (sessionJob === coroutineContext.job) {
+                    sessionJob = null
+                    returnToIdle()
+                }
             }
         }
     }
 
-    fun cancelTurn() {
+    private fun interruptToListen() {
+        audioPipeline.stopListening()
+        audioPipeline.stopSpeaking()
+        stopMouthAnimation()
+        val sessionRunning = sessionJob?.isActive == true
         turnJob?.cancel()
+        turnJob = null
+        if (!sessionRunning) {
+            startSession()
+        }
+    }
+
+    private fun endSession() {
+        sessionJob?.cancel()
+        turnJob?.cancel()
+        sessionJob = null
         turnJob = null
         mouthAnimJob?.cancel()
         mouthAnimJob = null
@@ -120,11 +159,12 @@ class PetBrain @Inject constructor(
             _state.value = PetTurnState.Idle
             return
         }
-        turnJob?.cancel()
+        endSession()
         turnJob = scope.launch {
             val trace = TurnTrace()
             try {
                 processText(text, trace)
+                returnToIdle()
             } catch (e: CancellationException) {
                 audioPipeline.stopSpeaking()
                 returnToIdle()
@@ -139,25 +179,71 @@ class PetBrain @Inject constructor(
         }
     }
 
+    /**
+     * Soft proactive line (e.g. usage-time nudge) — no mic, no LLM.
+     * Skipped if a turn is already in progress so we don't interrupt a chat.
+     */
+    fun speakProactive(message: String) {
+        val line = message.trim()
+        if (line.isEmpty()) return
+        if (_state.value !is PetTurnState.Idle) {
+            Log.d(TAG, "speakProactive skipped — pet busy (${_state.value})")
+            return
+        }
+        turnJob?.cancel()
+        turnJob = scope.launch {
+            try {
+                _listeningSubtitle.value = ""
+                _currentResponse.value = line
+                _state.value = PetTurnState.Speaking(line)
+                animationController.setExpression(PetExpression.HAPPY)
+                uiFeedback.petSpeakingStart()
+                startMouthAnimation()
+                if (!audioPipeline.isTtsReady) {
+                    audioPipeline.awaitPetVoiceEnginesReady(timeoutMs = 20_000L)
+                }
+                val cfg = sessionConfigStore.snapshot()
+                audioPipeline.speak(
+                    line,
+                    speakerId = cfg.ttsSpeakerId,
+                    volume = cfg.ttsVolume,
+                    speed = cfg.ttsSpeed,
+                )
+                stopMouthAnimation()
+                _state.value = PetTurnState.Settling(PetExpression.HAPPY, line)
+                delay(EMOTION_DURATION_MS)
+            } catch (e: CancellationException) {
+                audioPipeline.stopSpeaking()
+                throw e
+            } catch (e: Exception) {
+                Log.e(TAG, "speakProactive failed", e)
+            } finally {
+                if (sessionJob?.isActive != true) {
+                    returnToIdle()
+                }
+            }
+        }
+    }
+
     fun dismissTextInput() {
         _currentResponse.value = ""
         _state.value = PetTurnState.Idle
     }
 
     fun shutdown() {
-        cancelTurn()
+        endSession()
         warmUpJob?.cancel()
         warmUpJob = null
         audioPipeline.release()
     }
 
-    private suspend fun runTurn(trace: TurnTrace) {
+    private suspend fun runOneTurn(firstTurn: Boolean, trace: TurnTrace): TurnOutcome {
         if (!PermissionHelper.hasMicrophonePermission(appContext)) {
             speakError(
                 "Microphone is off for this app. Open KawaiiPet, tap Grant Mic on the home screen, or enable Microphone in Android app settings.",
                 holdMs = 4500L,
             )
-            return
+            return TurnOutcome.EndSession
         }
 
         val cfg = sessionConfigStore.snapshot()
@@ -177,16 +263,20 @@ class PetBrain @Inject constructor(
                     "Voice model is still loading. Wait a few seconds and tap again.",
                     holdMs = 3500L,
                 )
-                return
+                return TurnOutcome.EndSession
             }
         }
 
-        Analytics.capture(event = "voice conversation initiated")
+        if (firstTurn) {
+            Analytics.capture(event = "voice conversation initiated")
+        }
         _state.value = PetTurnState.Listening
         _listeningSubtitle.value = ""
+        _currentResponse.value = ""
         animationController.setExpression(PetExpression.LISTENING)
         uiFeedback.petListening()
-        warmUpLlmInBackground()
+        // Do not warm the LLM during mic/STT — LiteRT engine init races Moonshine
+        // on first tap and we saw empty transcripts while GPU load finished mid-listen.
 
         val listenStarted = SystemClock.elapsedRealtime()
         val userText = withContext(Dispatchers.Default) {
@@ -194,20 +284,14 @@ class PetBrain @Inject constructor(
         }
         trace.listenMs = SystemClock.elapsedRealtime() - listenStarted
         _listeningSubtitle.value = ""
-        _state.value = PetTurnState.Transcribing
         Log.d(TAG, "STT result: '$userText' (${trace.listenMs}ms)")
 
-        when {
-            userText.isBlank() || userText == "[voice]" -> {
-                animationController.setExpression(PetExpression.SAD)
-                uiFeedback.softNegative()
-                _currentResponse.value = LlmPromptDefaults.DIDNT_CATCH_REPLY
-                _state.value = PetTurnState.Speaking(LlmPromptDefaults.DIDNT_CATCH_REPLY)
-                delay(if (userText == "[voice]") EMOTION_DURATION_MS else 2000L)
-                returnToIdle()
-            }
-            else -> processText(userText, trace)
+        if (userText.isBlank() || userText == "[voice]") {
+            return TurnOutcome.EndSession
         }
+        _state.value = PetTurnState.Transcribing
+        processText(userText, trace)
+        return TurnOutcome.Continue
     }
 
     private suspend fun processText(userText: String, trace: TurnTrace) {
@@ -277,8 +361,16 @@ class PetBrain @Inject constructor(
                                 return@speak
                             }
                             lastTtsPiece = piece
-                            // Text first (Main), then hand audio to TTS.
-                            publishReplyUi(piece, startTalking = true)
+                            // Keep cumulative bubble from onPartial; only flip to Talking + queue TTS.
+                            withContext(Dispatchers.Main.immediate) {
+                                if (startedSpeaking.compareAndSet(false, true)) {
+                                    val shown = _currentResponse.value.ifBlank { piece }
+                                    _state.value = PetTurnState.Speaking(shown)
+                                    animationController.setExpression(PetExpression.TALKING)
+                                    uiFeedback.petSpeakingStart()
+                                    startMouthAnimation()
+                                }
+                            }
                             queuedTts.set(true)
                             if (sentenceChannel.trySend(piece).isFailure) {
                                 sentenceChannel.send(piece)
@@ -368,7 +460,6 @@ class PetBrain @Inject constructor(
             }
         } catch (e: CancellationException) {
             audioPipeline.stopSpeaking()
-            returnToIdle()
             throw e
         } catch (e: FileNotFoundException) {
             Log.e(TAG, "processText failed (missing file)", e)
@@ -381,8 +472,6 @@ class PetBrain @Inject constructor(
             stopMouthAnimation()
             recoverWithFriendlyFallback()
         }
-
-        returnToIdle()
     }
 
     private fun warmUpLlmInBackground() {
@@ -406,12 +495,22 @@ class PetBrain @Inject constructor(
         animationController.setExpression(PetExpression.SAD)
         uiFeedback.softNegative()
         _state.value = PetTurnState.Speaking(message)
-        delay(holdMs)
-        returnToIdle()
+        startMouthAnimation()
+        runCatching {
+            val cfg = sessionConfigStore.snapshot()
+            audioPipeline.speak(
+                text = message,
+                speakerId = cfg.ttsSpeakerId,
+                volume = cfg.ttsVolume,
+                speed = cfg.ttsSpeed,
+            )
+        }
+        delay(holdMs.coerceAtLeast(400L))
+        stopMouthAnimation()
     }
 
     private suspend fun recoverWithFriendlyFallback() {
-        val fallback = LlmPromptDefaults.CURIOUS_FALLBACK
+        val fallback = LlmPromptDefaults.DIDNT_CATCH_REPLY
         _currentResponse.value = fallback
         _state.value = PetTurnState.Speaking(fallback)
         animationController.setExpression(PetExpression.THINKING)
@@ -485,5 +584,10 @@ class PetBrain @Inject constructor(
         /** Cap wait so a stuck generation does not leave the UI in Thinking forever. */
         private const val LLM_TIMEOUT_MS = 25_000L
         private const val TTS_DRAIN_TIMEOUT_MS = 20_000L
+    }
+
+    private enum class TurnOutcome {
+        Continue,
+        EndSession,
     }
 }

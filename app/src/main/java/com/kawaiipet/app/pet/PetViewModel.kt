@@ -34,6 +34,8 @@ class PetViewModel(
 
     fun onTextSubmitted(text: String) = petBrain.onTextSubmitted(text)
 
+    fun speakProactive(message: String) = petBrain.speakProactive(message)
+
     fun dismissTextInput() = petBrain.dismissTextInput()
 
     fun cleanup() {

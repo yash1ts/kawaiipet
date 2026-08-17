@@ -67,6 +67,23 @@ class SttInputCleaner(
         return tmp
     }
 
+    /**
+     * RMS-level a finished VAD segment for Moonshine. Skips boosting near the noise floor
+     * so quiet rooms are not amplified into garbage transcripts.
+     */
+    fun levelFloatForAsr(samples: FloatArray): FloatArray {
+        if (samples.isEmpty()) return samples
+        var sumSq = 0.0
+        for (v in samples) sumSq += (v * v).toDouble()
+        val rms = sqrt(sumSq / samples.size).toFloat()
+        if (rms < ASR_NOISE_FLOOR) {
+            return samples
+        }
+        val gain = (ASR_TARGET_RMS / rms).coerceIn(ASR_MIN_GAIN, ASR_MAX_GAIN)
+        if (gain == 1f) return samples
+        return FloatArray(samples.size) { i -> (samples[i] * gain).coerceIn(-0.97f, 0.97f) }
+    }
+
     private fun highPassCoeff(fcHz: Float): Float {
         val dt = 1f / sampleRate
         val rc = 1f / (2f * Math.PI.toFloat() * fcHz)
@@ -79,5 +96,10 @@ class SttInputCleaner(
         private const val SMOOTH = 0.88f
         /** 120 Hz cuts low rumble without eating most vowels. */
         private const val HP_CUTOFF_HZ = 120f
+
+        private const val ASR_NOISE_FLOOR = 0.01f
+        private const val ASR_TARGET_RMS = 0.08f
+        private const val ASR_MIN_GAIN = 0.7f
+        private const val ASR_MAX_GAIN = 2.5f
     }
 }

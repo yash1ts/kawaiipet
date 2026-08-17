@@ -10,8 +10,9 @@ import java.lang.ref.WeakReference
 import javax.inject.Inject
 
 /**
- * Nearly invisible trampoline kept for one pet turn (listen → LLM → speak).
- * Reused by [AiForegroundGate] so the turn does not open a second activity/flash.
+ * Nearly invisible trampoline kept for one pet conversation
+ * (listen → LLM → speak loop until idle).
+ * Reused by [AiForegroundGate] so the session does not open a second activity/flash.
  */
 @AndroidEntryPoint
 class AiTriggerActivity : ComponentActivity() {

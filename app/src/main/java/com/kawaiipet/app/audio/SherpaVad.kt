@@ -11,23 +11,34 @@ import java.io.File
 /**
  * Neural VAD via sherpa-onnx Silero.
  *
- * Feed ungained float PCM (any length); samples are buffered into [VadEngineConfig.WINDOW_SIZE]
- * windows. Do not send AGC-boosted audio — leveling inflates noise and ruins the threshold.
+ * Feed ungained float PCM (any length); native code buffers to the model window.
+ * Do not send AGC-boosted audio — leveling inflates noise and ruins the threshold.
  */
 class SherpaVad(private val modelManager: ModelManager) {
 
     private val lock = Any()
     private var vad: Vad? = null
-    private var windowSize: Int = VadEngineConfig.WINDOW_SIZE
-    /** Leftover samples when mic chunks aren't a multiple of [windowSize]. */
-    private var pending = FloatArray(0)
+    private var initializedThreshold: Float? = null
+    private var initializedMinSilence: Float? = null
 
     val isInitialized: Boolean get() = synchronized(lock) { vad != null }
 
-    val windowSamples: Int get() = windowSize
-
-    fun initialize(): Boolean = synchronized(lock) {
-        if (vad != null) return true
+    fun initialize(
+        threshold: Float = VadEngineConfig.THRESHOLD,
+        minSilenceSec: Float = VadEngineConfig.MIN_SILENCE_SEC,
+    ): Boolean = synchronized(lock) {
+        val thr = threshold.coerceIn(VadEngineConfig.THRESHOLD_MIN, VadEngineConfig.THRESHOLD_MAX)
+        val silence = minSilenceSec.coerceIn(
+            VadEngineConfig.MIN_SILENCE_SEC_MIN,
+            VadEngineConfig.MIN_SILENCE_SEC_MAX,
+        )
+        if (vad != null && initializedThreshold == thr && initializedMinSilence == silence) {
+            return true
+        }
+        if (vad != null) {
+            runCatching { vad?.release() }
+            vad = null
+        }
         val modelFile = File(
             modelManager.getModelDir(DefaultVoiceModels.VAD_MODEL_ID),
             DefaultVoiceModels.VAD_FILE_NAME,
@@ -39,8 +50,8 @@ class SherpaVad(private val modelManager: ModelManager) {
         return try {
             val silero = SileroVadModelConfig(
                 model = modelFile.absolutePath,
-                threshold = VadEngineConfig.THRESHOLD,
-                minSilenceDuration = VadEngineConfig.MIN_SILENCE_SEC,
+                threshold = thr,
+                minSilenceDuration = silence,
                 minSpeechDuration = VadEngineConfig.MIN_SPEECH_SEC,
                 windowSize = VadEngineConfig.WINDOW_SIZE,
                 maxSpeechDuration = VadEngineConfig.MAX_SPEECH_SEC,
@@ -55,55 +66,40 @@ class SherpaVad(private val modelManager: ModelManager) {
             )
             // null AssetManager — model path is on disk.
             vad = Vad(null, config)
-            windowSize = VadEngineConfig.WINDOW_SIZE
-            pending = FloatArray(0)
+            initializedThreshold = thr
+            initializedMinSilence = silence
             Log.i(
                 TAG,
-                "Silero VAD ready threshold=${VadEngineConfig.THRESHOLD} " +
-                    "silence=${VadEngineConfig.MIN_SILENCE_SEC}s " +
+                "Silero VAD ready threshold=$thr " +
+                    "silence=${silence}s " +
                     "minSpeech=${VadEngineConfig.MIN_SPEECH_SEC}s " +
                     "maxSpeech=${VadEngineConfig.MAX_SPEECH_SEC}s " +
-                    "window=$windowSize path=${modelFile.absolutePath}",
+                    "window=${VadEngineConfig.WINDOW_SIZE} path=${modelFile.absolutePath}",
             )
             true
         } catch (t: Throwable) {
             Log.e(TAG, "Silero VAD init failed", t)
             vad = null
+            initializedThreshold = null
+            initializedMinSilence = null
             false
         }
     }
 
     fun reset() = synchronized(lock) {
-        pending = FloatArray(0)
         runCatching { vad?.reset() }
         runCatching { vad?.clear() }
     }
 
     /**
-     * Push mic floats (any length). Internally buffers to Silero's window size.
+     * Push mic floats (any length). Native Silero buffers to its window size internally
+     * (same as sherpa-onnx Android samples).
      * @return true if Silero currently considers the stream to be speech
      */
     fun acceptAndIsSpeech(samples: FloatArray): Boolean = synchronized(lock) {
         val v = vad ?: return false
-        if (samples.isEmpty()) return v.isSpeechDetected()
-        val merged = if (pending.isEmpty()) {
-            samples
-        } else {
-            FloatArray(pending.size + samples.size).also {
-                System.arraycopy(pending, 0, it, 0, pending.size)
-                System.arraycopy(samples, 0, it, pending.size, samples.size)
-            }
-        }
-        var offset = 0
-        while (offset + windowSize <= merged.size) {
-            val window = merged.copyOfRange(offset, offset + windowSize)
-            v.acceptWaveform(window)
-            offset += windowSize
-        }
-        pending = if (offset < merged.size) {
-            merged.copyOfRange(offset, merged.size)
-        } else {
-            FloatArray(0)
+        if (samples.isNotEmpty()) {
+            v.acceptWaveform(samples)
         }
         return v.isSpeechDetected()
     }
@@ -124,9 +120,10 @@ class SherpaVad(private val modelManager: ModelManager) {
     }
 
     fun release() = synchronized(lock) {
-        pending = FloatArray(0)
         runCatching { vad?.release() }
         vad = null
+        initializedThreshold = null
+        initializedMinSilence = null
     }
 
     companion object {

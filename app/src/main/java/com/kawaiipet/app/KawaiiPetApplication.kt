@@ -9,6 +9,7 @@ import com.kawaiipet.app.llm.LlmEngineWarmup
 import com.kawaiipet.app.memory.MemoryRepository
 import com.kawaiipet.app.memory.ShortTermMemory
 import com.kawaiipet.app.util.PreferenceManager
+import com.kawaiipet.app.usage.UsageReminderService
 import com.posthog.android.PostHogAndroid
 import com.posthog.android.PostHogAndroidConfig
 import dagger.hilt.android.HiltAndroidApp
@@ -45,6 +46,7 @@ class KawaiiPetApplication : Application() {
                 preferenceManager.migrateTtsVolumeDefaultIfNeeded()
                 memoryRepository.purgeContaminatedFacts()
                 shortTermMemory.clear()
+                UsageReminderService.syncWithPrefs(this@KawaiiPetApplication, preferenceManager)
             }
         }
     }

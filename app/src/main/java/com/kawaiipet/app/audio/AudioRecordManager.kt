@@ -9,6 +9,7 @@ import android.media.audiofx.AutomaticGainControl
 import android.media.audiofx.NoiseSuppressor
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
 
@@ -33,6 +34,24 @@ class AudioRecordManager {
     fun start(): Boolean {
         if (isRecording) return true
 
+        val existing = audioRecord
+        if (existing != null && existing.state == AudioRecord.STATE_INITIALIZED) {
+            return try {
+                existing.startRecording()
+                isRecording = true
+                Log.d(TAG, "AudioRecord resumed existing session")
+                true
+            } catch (t: Throwable) {
+                Log.w(TAG, "Resume failed — rebuilding AudioRecord", t)
+                teardownRecorder()
+                buildAndStart()
+            }
+        }
+        return buildAndStart()
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun buildAndStart(): Boolean {
         val minBuf = AudioRecord.getMinBufferSize(
             sampleRate,
             AudioFormat.CHANNEL_IN_MONO,
@@ -130,14 +149,38 @@ class AudioRecordManager {
         val buffer = ShortArray(CHUNK_SIZE)
         while (isActive && isRecording) {
             val read = audioRecord?.read(buffer, 0, CHUNK_SIZE) ?: break
-            if (read > 0) {
-                onSamples(buffer.copyOf(read))
+            when {
+                read > 0 -> onSamples(buffer.copyOf(read))
+                read == 0 -> delay(5)
+                read == AudioRecord.ERROR_INVALID_OPERATION ||
+                    read == AudioRecord.ERROR_BAD_VALUE ||
+                    read == AudioRecord.ERROR_DEAD_OBJECT -> {
+                    Log.w(TAG, "AudioRecord.read error=$read — stopping loop")
+                    break
+                }
+                else -> {
+                    Log.w(TAG, "AudioRecord.read unexpected=$read")
+                    delay(10)
+                }
             }
         }
     }
 
+    /** Stop capturing but keep the AudioRecord + effects for the next turn. */
     fun stop() {
         isRecording = false
+        try {
+            audioRecord?.stop()
+        } catch (_: IllegalStateException) {
+        }
+    }
+
+    fun release() {
+        isRecording = false
+        teardownRecorder()
+    }
+
+    private fun teardownRecorder() {
         releaseEffect(noiseSuppressor)
         noiseSuppressor = null
         releaseEffect(automaticGainControl)
@@ -150,10 +193,6 @@ class AudioRecordManager {
         }
         audioRecord?.release()
         audioRecord = null
-    }
-
-    fun release() {
-        stop()
     }
 
     private fun releaseEffect(effect: Any?) {
@@ -169,8 +208,8 @@ class AudioRecordManager {
 
     companion object {
         private const val TAG = "AudioRecordManager"
-        /** 100ms chunks @ 16 kHz — snappier VAD than 200ms. */
-        private const val CHUNK_SIZE = 1600
+        /** Match Silero's 512-sample window (~32 ms @ 16 kHz). */
+        const val CHUNK_SIZE = VadEngineConfig.WINDOW_SIZE
         /** Was 4; 6 reduces underruns when the UI/LLM thread is busy. */
         private const val BUFFER_MULTIPLIER = 6
     }

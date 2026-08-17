@@ -1,6 +1,7 @@
 package com.kawaiipet.app.pet
 
 import com.kawaiipet.app.audio.DefaultVoiceModels
+import com.kawaiipet.app.audio.VadEngineConfig
 import com.kawaiipet.app.llm.LlmPromptDefaults
 import com.kawaiipet.app.util.PreferenceManager
 import javax.inject.Inject
@@ -27,6 +28,12 @@ data class SessionConfig(
     val ttsSpeakerId: Int = 1,
     val ttsVolume: Float = PreferenceManager.TTS_VOLUME_DEFAULT,
     val ttsSpeed: Float = PreferenceManager.TTS_SPEED_DEFAULT,
+    val vadThreshold: Float = VadEngineConfig.THRESHOLD,
+    val vadMinSilenceSec: Float = VadEngineConfig.MIN_SILENCE_SEC,
+    val repetitionPenalty: Float = LlmPromptDefaults.REPETITION_PENALTY,
+    val presencePenalty: Float = LlmPromptDefaults.PRESENCE_PENALTY,
+    val frequencyPenalty: Float = LlmPromptDefaults.FREQUENCY_PENALTY,
+    val noRepeatNgramSize: Int = LlmPromptDefaults.NO_REPEAT_NGRAM_SIZE,
 )
 
 @Singleton
@@ -48,6 +55,12 @@ class SessionConfigStore @Inject constructor(
                 prefs.ttsSpeakerId.map { },
                 prefs.ttsVolume.map { },
                 prefs.ttsSpeed.map { },
+                prefs.vadThreshold.map { },
+                prefs.vadMinSilenceSec.map { },
+                prefs.repetitionPenalty.map { },
+                prefs.presencePenalty.map { },
+                prefs.frequencyPenalty.map { },
+                prefs.noRepeatNgramSize.map { },
             ).collect { refresh() }
         }
     }
@@ -61,6 +74,12 @@ class SessionConfigStore @Inject constructor(
             ttsSpeakerId = prefs.getTtsSpeakerId(),
             ttsVolume = prefs.getTtsVolume(),
             ttsSpeed = prefs.getTtsSpeed(),
+            vadThreshold = prefs.getVadThreshold(),
+            vadMinSilenceSec = prefs.getVadMinSilenceSec(),
+            repetitionPenalty = prefs.getRepetitionPenalty(),
+            presencePenalty = prefs.getPresencePenalty(),
+            frequencyPenalty = prefs.getFrequencyPenalty(),
+            noRepeatNgramSize = prefs.getNoRepeatNgramSize(),
         )
     }
 

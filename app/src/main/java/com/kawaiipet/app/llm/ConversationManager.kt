@@ -69,11 +69,6 @@ class ConversationManager @Inject constructor(
             return LlmResponse(spoken, expression, toolCall)
         }
 
-        // Keyword intent path: confirm + launch without involving the chat LLM.
-        if (LlmPromptDefaults.looksLikeActionIntent(text)) {
-            return processActionIntent(text, onPartial, onSpeakableSentence)
-        }
-
         shortTermMemory.addMessage(ChatMessage(Role.USER, text))
         val messages = shortTermMemory.getMessages()
         // Never block TTFT on LTM retrieval — index still happens after the turn.
@@ -88,9 +83,8 @@ class ConversationManager @Inject constructor(
             onPartial = { partial ->
                 val display = sanitizeForDisplay(partial)
                 lastDisplay = display
-                // Bubble updates on every token growth.
                 onPartial(display)
-                for (s in streamer.consume(display, text)) {
+                for (s in streamer.consume(display)) {
                     Log.d(TAG, "stream sentence: ${s.toOneLineLog()}")
                     onSpeakableSentence(s)
                 }
@@ -106,30 +100,29 @@ class ConversationManager @Inject constructor(
             )
         }
         val (cleanText, expression) = parseEmotionTag(rawResponse)
-        // Light cleanup only — Qwen is coherent enough without SmolLM-era quality gates.
         val spokenText = lightCleanReply(cleanText)
             .ifBlank { lastDisplay.trim() }
             .ifBlank { LlmPromptDefaults.DIDNT_CATCH_REPLY }
 
-        if (streamer.hasEmitted) {
-            val flushSource = when {
-                spokenText != LlmPromptDefaults.DIDNT_CATCH_REPLY -> spokenText
-                else -> lastDisplay.ifBlank { cleanText }
+        when {
+            streamer.hasSpoken -> {
+                for (s in streamer.flush(spokenText)) {
+                    Log.d(TAG, "flush sentence: ${s.toOneLineLog()}")
+                    onSpeakableSentence(s)
+                }
+                onPartial(spokenText)
             }
-            for (s in streamer.flush(flushSource, text)) {
-                onSpeakableSentence(s)
+            spokenText.isNotBlank() -> {
+                onPartial(spokenText)
+                onSpeakableSentence(spokenText)
             }
-        } else if (spokenText.isNotBlank() &&
-            spokenText != LlmPromptDefaults.DIDNT_CATCH_REPLY
-        ) {
-            onSpeakableSentence(spokenText)
         }
 
         Log.i(
             TAG,
             "llm parsed: expression=$expression tool=${toolCall?.intent?.id} " +
                 "query=${toolCall?.query?.take(40)} cleanLen=${cleanText.length} " +
-                "spoken=${spokenText.toOneLineLog()} streamed=${streamer.hasEmitted}",
+                "spoken=${spokenText.toOneLineLog()} streamed=${streamer.hasSpoken}",
         )
 
         if (spokenText.isNotBlank()) {
@@ -152,44 +145,6 @@ class ConversationManager @Inject constructor(
     suspend fun clearConversationFully() {
         shortTermMemory.clear()
         llmService.resetSession()
-    }
-
-    /**
-     * Keyword/NLU action path: immediate spoken confirm + launch from utterance parse.
-     * No LLM involvement (chat model is buddy-chat only).
-     */
-    private suspend fun processActionIntent(
-        text: String,
-        onPartial: suspend (String) -> Unit,
-        onSpeakableSentence: suspend (String) -> Unit,
-    ): LlmResponse {
-        shortTermMemory.addMessage(ChatMessage(Role.USER, text))
-        val toolCall = PetToolIntent.detectToolCallFromUserUtterance(text)
-        val immediate = if (toolCall != null) {
-            confirmationForTool(toolCall)
-        } else {
-            "On it!"
-        }
-        Log.i(
-            TAG,
-            "action intent immediate=${immediate.toOneLineLog()} " +
-                "tool=${toolCall?.intent?.id} query=${toolCall?.query?.take(60)}",
-        )
-        onPartial(immediate)
-        onSpeakableSentence(immediate)
-
-        shortTermMemory.addMessage(ChatMessage(Role.ASSISTANT, immediate))
-        return LlmResponse(immediate, PetExpression.HAPPY, toolCall)
-    }
-
-    private fun confirmationForTool(call: PetToolCall): String {
-        val label = call.intent.label
-        val q = call.query?.trim().orEmpty()
-        return if (q.isNotEmpty()) {
-            "On it — searching $label for $q!"
-        } else {
-            "Opening $label!"
-        }
     }
 
     /** Strip role labels / extra whitespace; soft-cap length for TTS. */
@@ -224,7 +179,7 @@ class ConversationManager @Inject constructor(
                 .take(LOG_SNIP_LEN)
 
         private val EMOTION_TAG_REGEX =
-            "\\[(happy|sad|angry|thinking|idle|listening|talking|sleeping)\\]"
+            "\\[(happy|sad|angry|thinking|curious|idle|listening|talking|sleeping)\\]"
                 .toRegex(RegexOption.IGNORE_CASE)
 
         /**
@@ -239,7 +194,7 @@ class ConversationManager @Inject constructor(
         private val TRAILING_PARTIAL_TAG_REGEX = "\\[[^\\]]*$".toRegex()
 
         fun sanitizeForDisplay(partialRaw: String): String =
-            LlmPromptDefaults.sanitizeModelSpeech(
+            LlmPromptDefaults.sanitizeModelSpeechIncremental(
                 partialRaw
                     .replace(TOOL_CALL_TAG_REGEX, "")
                     .replace(EMOTION_TAG_REGEX, ""),

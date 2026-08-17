@@ -1,6 +1,7 @@
 package com.kawaiipet.app.util
 
 import android.util.Log
+import com.kawaiipet.app.BuildConfig
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
@@ -16,8 +17,8 @@ object DebugSessionLog {
     private const val ENDPOINT = "http://127.0.0.1:7932/ingest"
     private const val SESSION_ID = "886061"
     private const val MAX_BUFFER = 64
-    /** Off on the chat hot path — JSON + Log.i per token added measurable latency. */
-    private const val ENABLED = false
+    /** Debug builds only — stage timings for VAD / ASR / LLM / TTS. */
+    private val enabled: Boolean get() = BuildConfig.DEBUG
 
     private val buffer = ConcurrentLinkedQueue<String>()
     private val buffered = AtomicInteger(0)
@@ -29,7 +30,7 @@ object DebugSessionLog {
         data: Map<String, Any?> = emptyMap(),
         runId: String = "post-fix",
     ) {
-        if (!ENABLED) return
+        if (!enabled) return
         val payload = JSONObject()
         payload.put("sessionId", SESSION_ID)
         payload.put("hypothesisId", hypothesisId)
@@ -54,7 +55,7 @@ object DebugSessionLog {
 
     /** Flush buffered events once at end of a turn (daemon thread). */
     fun flushTurn(extra: Map<String, Any?> = emptyMap()) {
-        if (!ENABLED) return
+        if (!enabled) return
         if (extra.isNotEmpty()) {
             log(
                 hypothesisId = "TRACE",

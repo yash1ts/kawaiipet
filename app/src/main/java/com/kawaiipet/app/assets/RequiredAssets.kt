@@ -8,11 +8,11 @@ import com.kawaiipet.app.audio.DefaultVoiceModels
 object RequiredAssets {
 
     /**
-     * Qwen3-0.6B INT4 no-think via LiteRT-LM (~347 MB).
-     * Prefills empty `<think></think>` so replies are direct (no CoT to strip); ekv1280.
+     * LFM2.5-1.2B-Instruct INT4 via LiteRT-LM (~736 MB).
+     * GPU artifact (`_int4_gpu`) also runs on CPU; needs LiteRT-LM 0.16+.
      */
-    const val LLM_MODEL_ID = "qwen3-0.6b-nothink"
-    const val LLM_FILE_NAME = "qwen3_0.6b_nothink_q4_block32_ekv1280.litertlm"
+    const val LLM_MODEL_ID = "lfm2.5-1.2b-instruct"
+    const val LLM_FILE_NAME = "LFM2.5-1.2B-Instruct_int4_gpu.litertlm"
 
     const val EMBEDDER_MODEL_ID = "all-minilm-l6-v2"
     const val EMBEDDER_ONNX_FILE = "model.onnx"
@@ -21,14 +21,14 @@ object RequiredAssets {
     private const val MINILM_BASE =
         "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main"
 
-    private const val QWEN3_LITERT_BASE =
-        "https://huggingface.co/litert-community/Qwen3-0.6B-int4/resolve/main"
+    private const val LLM_LITERT_BASE =
+        "https://huggingface.co/litert-community/LFM2.5-1.2B-Instruct/resolve/main"
 
     val ALL: List<AssetSpec> = listOf(
         AssetSpec(
             id = LLM_MODEL_ID,
             displayName = "Pet brain",
-            url = "$QWEN3_LITERT_BASE/$LLM_FILE_NAME",
+            url = "$LLM_LITERT_BASE/$LLM_FILE_NAME",
             kind = AssetKind.RawFile(fileName = LLM_FILE_NAME),
         ),
         AssetSpec(

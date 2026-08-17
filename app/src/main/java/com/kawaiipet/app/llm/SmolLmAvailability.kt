@@ -18,7 +18,7 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
 /**
- * Owns the on-device LiteRT-LM [Engine] backed by Qwen3-0.6B INT4 (no-think).
+ * Owns the on-device LiteRT-LM [Engine] backed by LFM2.5-1.2B-Instruct INT4.
  */
 @Singleton
 class SmolLmAvailability @Inject constructor(
@@ -33,6 +33,9 @@ class SmolLmAvailability @Inject constructor(
     @Volatile
     private var warmedUp = false
 
+    @Volatile
+    private var activeBackendName: String? = null
+
     fun modelFile(): File =
         File(modelManager.getModelDir(RequiredAssets.LLM_MODEL_ID), RequiredAssets.LLM_FILE_NAME)
 
@@ -40,27 +43,42 @@ class SmolLmAvailability @Inject constructor(
 
     fun isReady(): Boolean = warmedUp && engine != null
 
+    fun currentBackendName(): String? = activeBackendName
+
     suspend fun ensureReady(): Engine = mutex.withLock {
         engine?.let { return it }
+        createEngineLocked(preferCpu = false)
+    }
+
+    /**
+     * Tear down the current engine and recreate on CPU.
+     * Used when GPU decode fails with logits-shape errors on some devices.
+     */
+    suspend fun recreateOnCpu(): Engine = mutex.withLock {
+        closeLocked()
+        createEngineLocked(preferCpu = true)
+    }
+
+    private suspend fun createEngineLocked(preferCpu: Boolean): Engine {
         val path = modelFile().absolutePath
         if (!isModelOnDisk()) {
-            error("Qwen3 model missing at $path")
+            error("LFM2.5 model missing at $path")
         }
-        withContext(Dispatchers.Default) {
+        return withContext(Dispatchers.Default) {
             Engine.setNativeMinLogSeverity(LogSeverity.ERROR)
-            // GPU first for throughput on Pixel; Tensor NPU next; CPU last resort.
-            val backends = listOf(
-                Backend.GPU(),
-                Backend.GOOGLE_TENSOR(),
-                Backend.CPU(),
-            )
+            val backends = if (preferCpu) {
+                listOf(Backend.CPU(), Backend.GOOGLE_TENSOR(), Backend.GPU())
+            } else {
+                // GPU first for throughput on Pixel; Tensor NPU next; CPU last resort.
+                listOf(Backend.GPU(), Backend.GOOGLE_TENSOR(), Backend.CPU())
+            }
             var lastError: Throwable? = null
             for (backend in backends) {
                 try {
                     val config = EngineConfig(
                         modelPath = path,
                         backend = backend,
-                        // Must be <= model KV (ekv1280). Smaller = faster allocate for short turns.
+                        // Model KV is 4096; keep a short-chat budget so allocate stays cheap.
                         maxNumTokens = MAX_NUM_TOKENS,
                         cacheDir = context.cacheDir.absolutePath,
                     )
@@ -69,6 +87,7 @@ class SmolLmAvailability @Inject constructor(
                     created.initialize()
                     engine = created
                     warmedUp = true
+                    activeBackendName = backend.name
                     Log.i(TAG, "LiteRT-LM engine ready on ${backend.name}")
                     return@withContext created
                 } catch (t: Throwable) {
@@ -82,18 +101,26 @@ class SmolLmAvailability @Inject constructor(
 
     suspend fun warmUp() {
         runCatching { ensureReady() }
-            .onFailure { Log.w(TAG, "Qwen3 warmUp failed", it) }
+            .onFailure { Log.w(TAG, "LFM2.5 warmUp failed", it) }
     }
 
     fun close() {
         runCatching { engine?.close() }
         engine = null
         warmedUp = false
+        activeBackendName = null
+    }
+
+    private fun closeLocked() {
+        runCatching { engine?.close() }
+        engine = null
+        warmedUp = false
+        activeBackendName = null
     }
 
     companion object {
         private const val TAG = "SmolLmAvailability"
-        /** Matches qwen3_*_ekv1280.litertlm KV cache length. */
+        /** Cap below the model's 4096 KV so short pet turns allocate faster. */
         private const val MAX_NUM_TOKENS = 1280
     }
 }

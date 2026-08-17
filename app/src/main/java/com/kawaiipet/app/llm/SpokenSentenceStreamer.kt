@@ -2,20 +2,25 @@ package com.kawaiipet.app.llm
 
 /**
  * Turns cumulative sanitized LLM text into speakable chunks as soon as possible
- * so TTS can start before the model finishes a full sentence.
+ * so TTS can start before the model finishes.
  */
 class SpokenSentenceStreamer {
 
     private var emitted = ""
     private var emittedCount = 0
+    private var spokenCount = 0
     private var lastPieceKey = ""
 
-    val hasEmitted: Boolean get() = emittedCount > 0
+    /** True if any sentence was handed to TTS. */
+    val hasSpoken: Boolean get() = spokenCount > 0
+
+    @Deprecated("Use hasSpoken", ReplaceWith("hasSpoken"))
+    val hasEmitted: Boolean get() = hasSpoken
 
     fun consume(sanitizedCumulative: String, @Suppress("UNUSED_PARAMETER") userText: String = ""): List<String> {
         val text = sanitizedCumulative.trim()
         if (text.isEmpty()) return emptyList()
-        if (emittedCount >= LlmPromptDefaults.MAX_REPLY_SENTENCES) return emptyList()
+        if (spokenCount >= LlmPromptDefaults.MAX_REPLY_SENTENCES) return emptyList()
 
         val pending = pendingRemainder(text)
         if (pending.isEmpty()) return emptyList()
@@ -23,14 +28,17 @@ class SpokenSentenceStreamer {
         val out = ArrayList<String>(4)
         var offset = 0
         while (offset < pending.length) {
-            if (emittedCount >= LlmPromptDefaults.MAX_REPLY_SENTENCES) break
+            if (spokenCount >= LlmPromptDefaults.MAX_REPLY_SENTENCES) break
             val remaining = pending.substring(offset)
             val end = indexOfSentenceEnd(remaining)
             if (end < 0) {
-                if (emittedCount == 0) {
+                if (spokenCount == 0 && emittedCount == 0) {
                     val early = earlyFirstChunk(remaining) ?: break
                     appendEmitted(early)
-                    out += early
+                    if (acceptPiece(early)) {
+                        spokenCount++
+                        out += early
+                    }
                     offset += early.length
                     while (offset < pending.length && pending[offset].isWhitespace()) offset++
                     continue
@@ -41,24 +49,17 @@ class SpokenSentenceStreamer {
             offset += end + 1
             while (offset < pending.length && pending[offset].isWhitespace()) offset++
             val sentence = rawPiece.trim()
-            if (sentence.isNotEmpty() && acceptPiece(sentence)) {
-                appendEmitted(sentence)
-                out += sentence
-            } else if (sentence.isNotEmpty()) {
-                if (sentence.any { it.isLetterOrDigit() }) {
-                    emitted = listOf(emitted.trim(), sentence)
-                        .filter { it.isNotEmpty() }
-                        .joinToString(" ")
-                } else {
-                    emitted = (emitted.trimEnd() + sentence.trim()).trim()
-                }
-            }
+            if (sentence.isEmpty()) continue
+            appendEmitted(sentence)
+            if (!acceptPiece(sentence)) continue
+            spokenCount++
+            out += sentence
         }
         return out
     }
 
     fun flush(sanitizedFinal: String, @Suppress("UNUSED_PARAMETER") userText: String = ""): List<String> {
-        if (emittedCount >= LlmPromptDefaults.MAX_REPLY_SENTENCES) return emptyList()
+        if (spokenCount >= LlmPromptDefaults.MAX_REPLY_SENTENCES) return emptyList()
         val text = sanitizedFinal.trim()
         val rem = pendingRemainder(text).trim()
         if (rem.isEmpty()) return emptyList()
@@ -71,6 +72,7 @@ class SpokenSentenceStreamer {
             return emptyList()
         }
         appendEmitted(rem)
+        spokenCount++
         return listOf(rem)
     }
 
@@ -87,14 +89,13 @@ class SpokenSentenceStreamer {
         if (pending.length < FIRST_STREAM_MIN) return null
         val window = pending.take(FIRST_STREAM_TARGET)
         val breakAt = window.indexOfLast { it.isWhitespace() }
-        if (breakAt < FIRST_STREAM_MIN) {
+        val piece = if (breakAt < FIRST_STREAM_MIN) {
             if (pending.length < FIRST_STREAM_FORCE) return null
-            val forced = pending.take(FIRST_STREAM_TARGET).trim()
-            return forced.takeIf { acceptPiece(it) }
+            pending.take(FIRST_STREAM_TARGET).trim()
+        } else {
+            pending.take(breakAt).trim().takeIf { it.length >= FIRST_STREAM_MIN } ?: return null
         }
-        val piece = pending.take(breakAt).trim()
-        if (piece.length < FIRST_STREAM_MIN) return null
-        return piece.takeIf { acceptPiece(it) }
+        return piece
     }
 
     private fun pendingRemainder(text: String): String {

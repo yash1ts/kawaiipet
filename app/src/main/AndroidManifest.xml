@@ -15,6 +15,10 @@
     <!-- Needed so the pet can list launchable apps and open them via tool tags. -->
     <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES"
         tools:ignore="QueryAllPackagesPermission" />
+    <!-- Soft break reminders based on continuous foreground time in a watched app. -->
+    <uses-permission
+        android:name="android.permission.PACKAGE_USAGE_STATS"
+        tools:ignore="ProtectedPermissions" />
 
     <!-- Package visibility for launcher apps (works alongside QUERY_ALL_PACKAGES). -->
     <queries>
@@ -104,6 +108,15 @@
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="Floating on-device AI pet overlay with microphone and speech playback" />
+        </service>
+
+        <service
+            android:name=".usage.UsageReminderService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Monitors continuous app usage to gently nudge the user via the pet overlay" />
         </service>
 
         <service

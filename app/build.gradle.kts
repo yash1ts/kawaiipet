@@ -225,7 +225,7 @@ dependencies {
 
     implementation(libs.posthog.android)
 
-    // Google LiteRT-LM (Qwen3 on-device)
+    // Google LiteRT-LM (on-device chat)
     implementation(libs.litertlm.android)
 
     // Google AI Edge RAG (SqliteVectorStore + SemanticTextMemory)
