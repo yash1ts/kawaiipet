@@ -3,11 +3,14 @@ package com.kawaiipet.app.usage
 import android.app.Notification
 import android.app.PendingIntent
 import android.app.Service
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
@@ -29,9 +32,10 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
 /**
- * Lightweight FGS that polls continuous foreground time for watched apps (up to 5).
- * When a limit is hit, starts the pet overlay and asks it to speak a soft nudge.
- * Ignoring the pet and staying in that app re-arms after another full continuous limit.
+ * Play-compliant monitor: [UsageStatsManager] polling from a special-use FGS
+ * (same pattern as screen-time apps). Accessibility is not used.
+ *
+ * Android requires a visible notification for any FGS. The channel is silent/low.
  */
 @AndroidEntryPoint
 class UsageReminderService : Service() {
@@ -43,9 +47,30 @@ class UsageReminderService : Service() {
     private var pollJob: Job? = null
     /** Per-package last nudge so each watched app re-arms independently. */
     private val lastNudgeAtByPackage = mutableMapOf<String, Long>()
+    @Volatile private var screenOn = true
+
+    private val screenReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            when (intent?.action) {
+                Intent.ACTION_SCREEN_OFF -> screenOn = false
+                Intent.ACTION_SCREEN_ON, Intent.ACTION_USER_PRESENT -> screenOn = true
+            }
+        }
+    }
 
     override fun onCreate() {
         super.onCreate()
+        screenOn = isScreenInteractive()
+        ContextCompat.registerReceiver(
+            this,
+            screenReceiver,
+            IntentFilter().apply {
+                addAction(Intent.ACTION_SCREEN_OFF)
+                addAction(Intent.ACTION_SCREEN_ON)
+                addAction(Intent.ACTION_USER_PRESENT)
+            },
+            ContextCompat.RECEIVER_EXPORTED,
+        )
         startAsForeground()
         pollJob = scope.launch { pollLoop() }
         Log.i(TAG, "Usage reminder monitor started")
@@ -58,56 +83,68 @@ class UsageReminderService : Service() {
     override fun onDestroy() {
         pollJob?.cancel()
         scope.cancel()
+        runCatching { unregisterReceiver(screenReceiver) }
         Log.i(TAG, "Usage reminder monitor stopped")
         super.onDestroy()
     }
 
     private suspend fun pollLoop() {
         while (scope.isActive) {
-            runCatching { tick() }
+            val watchedInForeground = runCatching { tick() }
                 .onFailure { e -> Log.w(TAG, "poll tick failed", e) }
-            delay(POLL_INTERVAL_MS)
+                .getOrDefault(false)
+            delay(if (watchedInForeground) POLL_ACTIVE_MS else POLL_IDLE_MS)
         }
     }
 
-    private suspend fun tick() {
+    /** @return true if a watched app is currently in the foreground (screen on). */
+    private suspend fun tick(): Boolean {
         val enabled = preferenceManager.getUsageReminderEnabled()
         val targets = preferenceManager.getUsageReminderTargets()
         val limitMinutes = preferenceManager.getUsageReminderLimitMinutes()
         if (!enabled || targets.isEmpty()) {
             stopSelf()
-            return
+            return false
         }
         if (!PermissionHelper.hasUsageAccessPermission(this)) {
             Log.w(TAG, "Usage access revoked — stopping monitor")
             preferenceManager.setUsageReminderEnabled(false)
             stopSelf()
-            return
+            return false
+        }
+        if (!screenOn || !isScreenInteractive()) {
+            screenOn = false
+            return false
         }
 
-        val limitMs = limitMinutes * 60_000L
-        val now = System.currentTimeMillis()
+        val session = usageStatsTracker.currentForegroundSession() ?: return false
         val watched = targets.associateBy { it.packageName }
+        val app = watched[session.packageName] ?: return false
+
+        val now = System.currentTimeMillis()
         lastNudgeAtByPackage.keys.retainAll(watched.keys)
 
-        for (app in targets) {
-            val continuousMs = usageStatsTracker.continuousForegroundMs(app.packageName, now)
-            if (continuousMs < limitMs) continue
-            val lastNudge = lastNudgeAtByPackage[app.packageName] ?: 0L
-            if (now - lastNudge < limitMs) continue
+        val limitMs = limitMinutes * 60_000L
+        val continuousMs = session.continuousMs(now)
+        if (continuousMs < limitMs) return true
+        val lastNudge = lastNudgeAtByPackage[app.packageName] ?: 0L
+        if (now - lastNudge < limitMs) return true
 
-            lastNudgeAtByPackage[app.packageName] = now
-            Log.i(
-                TAG,
-                "Usage limit hit for ${app.packageName} continuous=${continuousMs / 1000}s limit=${limitMinutes}m",
-            )
-            fireNudge(
-                appLabel = app.label.ifBlank { app.packageName },
-                continuousMinutes = ((continuousMs + 30_000L) / 60_000L).toInt().coerceAtLeast(1),
-            )
-            // One nudge per poll tick — avoid stacking overlays if several somehow match.
-            break
-        }
+        lastNudgeAtByPackage[app.packageName] = now
+        Log.i(
+            TAG,
+            "Usage limit hit for ${app.packageName} continuous=${continuousMs / 1000}s limit=${limitMinutes}m",
+        )
+        fireNudge(
+            appLabel = app.label.ifBlank { app.packageName },
+            continuousMinutes = ((continuousMs + 30_000L) / 60_000L).toInt().coerceAtLeast(1),
+        )
+        return true
+    }
+
+    private fun isScreenInteractive(): Boolean {
+        val pm = getSystemService(PowerManager::class.java) ?: return true
+        return pm.isInteractive
     }
 
     private fun fireNudge(appLabel: String, continuousMinutes: Int) {
@@ -115,8 +152,6 @@ class UsageReminderService : Service() {
             Log.w(TAG, "Cannot show pet — overlay permission missing")
             return
         }
-        // Appear over the watched app via TYPE_APPLICATION_OVERLAY. Do not
-        // send the user to Home — that hijacks the foreground app.
         val message = UsageReminderMessages.next(appLabel = appLabel, minutes = continuousMinutes)
         val intent = Intent(this, PetOverlayService::class.java).apply {
             action = PetOverlayService.ACTION_USAGE_NUDGE
@@ -153,20 +188,28 @@ class UsageReminderService : Service() {
             Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_IMMUTABLE,
         )
-        return NotificationCompat.Builder(this, KawaiiPetApplication.NOTIFICATION_CHANNEL_ID)
+        return NotificationCompat.Builder(this, KawaiiPetApplication.USAGE_MONITOR_CHANNEL_ID)
             .setContentTitle(getString(R.string.usage_reminder_notification_title))
             .setContentText(getString(R.string.usage_reminder_notification_text))
             .setSmallIcon(R.drawable.ic_pet_notification)
-            .setPriority(NotificationCompat.PRIORITY_LOW)
-            .setContentIntent(tapIntent)
             .setOngoing(true)
+            .setSilent(true)
+            .setShowWhen(false)
+            .setOnlyAlertOnce(true)
+            .setCategory(NotificationCompat.CATEGORY_SERVICE)
+            .setVisibility(NotificationCompat.VISIBILITY_SECRET)
+            .setPriority(NotificationCompat.PRIORITY_MIN)
+            .setContentIntent(tapIntent)
             .build()
     }
 
     companion object {
         private const val TAG = "UsageReminderService"
         private const val NOTIFICATION_ID = 2
-        private const val POLL_INTERVAL_MS = 15_000L
+        /** Watched app is open — tight enough for a minute-scale limit. */
+        private const val POLL_ACTIVE_MS = 15_000L
+        /** Nothing to watch — UsageStats lag is ~1s; 45s is plenty and cheaper. */
+        private const val POLL_IDLE_MS = 45_000L
 
         fun start(context: Context) {
             val app = context.applicationContext

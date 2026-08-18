@@ -8,35 +8,51 @@ import dagger.hilt.android.qualifiers.ApplicationContext
 import javax.inject.Inject
 import javax.inject.Singleton
 
+data class ForegroundSession(
+    val packageName: String,
+    val sinceMs: Long,
+) {
+    fun continuousMs(nowMs: Long): Long = (nowMs - sinceMs).coerceAtLeast(0L)
+}
+
 /**
- * Reads [UsageStatsManager] events to estimate how long [packageName] has been
- * continuously in the foreground (uninterrupted by another app).
+ * Reads [UsageStatsManager] events — the Play-compliant way to learn which app
+ * is in the foreground (no AccessibilityService).
  */
 @Singleton
 class UsageStatsTracker @Inject constructor(
     @param:ApplicationContext private val appContext: Context,
 ) {
     /**
-     * Milliseconds the [packageName] has been continuously foreground ending at [nowMs].
-     * Returns 0 if it is not currently foreground or usage access is missing.
+     * App currently in the foreground, with when this uninterrupted session began.
+     * Null if the screen is off, usage access is missing, or only system UI is showing.
      */
-    fun continuousForegroundMs(packageName: String, nowMs: Long = System.currentTimeMillis()): Long {
-        if (packageName.isBlank()) return 0L
-        val usm = usageStatsManager() ?: return 0L
-
-        // Look back far enough to cover the longest supported limit + buffer.
-        val begin = nowMs - CONTINUOUS_LOOKBACK_MS
-        val events = usm.queryEvents(begin, nowMs)
+    fun currentForegroundSession(nowMs: Long = System.currentTimeMillis()): ForegroundSession? {
+        val usm = usageStatsManager() ?: return null
+        val events = usm.queryEvents(nowMs - CONTINUOUS_LOOKBACK_MS, nowMs)
         val event = UsageEvents.Event()
+        val ignored = ignoredForegroundPackages()
 
         var currentFg: String? = null
         var fgSince: Long? = null
+        var screenInteractive = true
 
         while (events.hasNextEvent()) {
             events.getNextEvent(event)
             when {
+                isScreenNonInteractive(event) -> {
+                    screenInteractive = false
+                    currentFg = null
+                    fgSince = null
+                }
+                isScreenInteractive(event) -> {
+                    screenInteractive = true
+                }
                 isMoveToForeground(event) -> {
-                    currentFg = event.packageName
+                    if (!screenInteractive) continue
+                    val pkg = event.packageName ?: continue
+                    if (pkg in ignored) continue
+                    currentFg = pkg
                     fgSince = event.timeStamp
                 }
                 isMoveToBackground(event) -> {
@@ -48,8 +64,10 @@ class UsageStatsTracker @Inject constructor(
             }
         }
 
-        if (currentFg != packageName || fgSince == null) return 0L
-        return (nowMs - fgSince).coerceAtLeast(0L)
+        if (!screenInteractive) return null
+        val pkg = currentFg ?: return null
+        val since = fgSince ?: return null
+        return ForegroundSession(packageName = pkg, sinceMs = since)
     }
 
     /**
@@ -76,8 +94,25 @@ class UsageStatsTracker @Inject constructor(
         return out
     }
 
+    private fun ignoredForegroundPackages(): Set<String> = setOf(
+        appContext.packageName,
+        "android",
+        "com.android.systemui",
+        "com.android.permissioncontroller",
+        "com.google.android.permissioncontroller",
+        "com.google.android.packageinstaller",
+    )
+
     private fun usageStatsManager(): UsageStatsManager? =
         appContext.getSystemService(Context.USAGE_STATS_SERVICE) as? UsageStatsManager
+
+    private fun isScreenInteractive(event: UsageEvents.Event): Boolean =
+        Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
+            event.eventType == UsageEvents.Event.SCREEN_INTERACTIVE
+
+    private fun isScreenNonInteractive(event: UsageEvents.Event): Boolean =
+        Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
+            event.eventType == UsageEvents.Event.SCREEN_NON_INTERACTIVE
 
     private fun isMoveToForeground(event: UsageEvents.Event): Boolean {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -96,7 +131,8 @@ class UsageStatsTracker @Inject constructor(
     }
 
     companion object {
-        private const val CONTINUOUS_LOOKBACK_MS = 4L * 60L * 60L * 1000L // 4h
-        private const val RECENT_LOOKBACK_MS = 14L * 24L * 60L * 60L * 1000L // 14d
+        /** Long enough to cover the max 120-minute limit plus a long session. */
+        private const val CONTINUOUS_LOOKBACK_MS = 4L * 60L * 60L * 1000L
+        private const val RECENT_LOOKBACK_MS = 14L * 24L * 60L * 60L * 1000L
     }
 }

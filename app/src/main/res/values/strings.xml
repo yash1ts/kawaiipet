@@ -55,10 +55,12 @@
     <string name="usage_reminder_limit_value">%1$d minutes</string>
     <string name="usage_reminder_limit_hint">If you ignore the pet and keep using that app, another nudge fires after this much continuous time again. Each watched app tracks separately.</string>
     <string name="usage_reminder_enable">Remind me</string>
-    <string name="usage_reminder_enable_hint">Keeps a quiet monitor running while this is on.</string>
+    <string name="usage_reminder_enable_hint">A silent notification stays while this is on — Android requires it for the monitor. Locking the phone pauses the timer.</string>
     <string name="usage_reminder_overlay_note">Display-over-apps must also be allowed so the pet can appear on top of a watched app.</string>
     <string name="usage_reminder_notification_title">Break reminders on</string>
-    <string name="usage_reminder_notification_text">Watching continuous time in your selected apps</string>
+    <string name="usage_reminder_notification_text">Watching your selected apps</string>
+    <string name="usage_reminder_notification_channel_name">Break reminder monitor</string>
+    <string name="usage_reminder_notification_channel_description">Silent status while break reminders are running. Required to watch app time in the background.</string>
     <string name="assets_title">Getting ready</string>
     <string name="assets_subtitle">One-time setup — download the offline brain and voice so your pet can run without the cloud.</string>
     <string name="assets_checking">Checking what\'s already installed…</string>

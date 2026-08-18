@@ -29,7 +29,7 @@ class KawaiiPetApplication : Application() {
         super.onCreate()
         voiceEngineWarmup.startWarmup()
         llmEngineWarmup.startWarmup("app_start")
-        createNotificationChannel()
+        createNotificationChannels()
         // Drop known contaminated memory lines that made SmolLM loop.
         CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
             runCatching {
@@ -44,19 +44,31 @@ class KawaiiPetApplication : Application() {
         }
     }
 
-    private fun createNotificationChannel() {
-        val channel = NotificationChannel(
-            NOTIFICATION_CHANNEL_ID,
-            getString(R.string.notification_channel_name),
-            NotificationManager.IMPORTANCE_LOW
-        ).apply {
-            description = getString(R.string.notification_channel_description)
-        }
-        getSystemService(NotificationManager::class.java)
-            .createNotificationChannel(channel)
+    private fun createNotificationChannels() {
+        val manager = getSystemService(NotificationManager::class.java)
+        manager.createNotificationChannel(
+            NotificationChannel(
+                NOTIFICATION_CHANNEL_ID,
+                getString(R.string.notification_channel_name),
+                NotificationManager.IMPORTANCE_LOW,
+            ).apply {
+                description = getString(R.string.notification_channel_description)
+            },
+        )
+        manager.createNotificationChannel(
+            NotificationChannel(
+                USAGE_MONITOR_CHANNEL_ID,
+                getString(R.string.usage_reminder_notification_channel_name),
+                NotificationManager.IMPORTANCE_LOW,
+            ).apply {
+                description = getString(R.string.usage_reminder_notification_channel_description)
+                setShowBadge(false)
+            },
+        )
     }
 
     companion object {
         const val NOTIFICATION_CHANNEL_ID = "kawaiipet_overlay"
+        const val USAGE_MONITOR_CHANNEL_ID = "kawaiipet_usage_monitor"
     }
 }
