@@ -10,9 +10,7 @@ const DEFAULT_APK_HREF =
  */
 export function resolveApkDownloadHref(): string {
   const fromEnv =
-    process.env.APK_LINK?.trim() ||
-    process.env.NEXT_PUBLIC_APK_LINK?.trim() ||
-    process.env.NEXT_PUBLIC_APK_URL?.trim();
+    process.env.APK_LINK?.trim()
   if (fromEnv) return fromEnv;
   const apkPath = path.join(process.cwd(), "public", "kawaiipet.apk");
   if (existsSync(apkPath)) return "/kawaiipet.apk";
