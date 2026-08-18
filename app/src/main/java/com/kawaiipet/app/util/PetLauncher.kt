@@ -33,9 +33,12 @@ object PetLauncher {
                 )
             }
             !PermissionHelper.hasOverlayPermission(app) -> {
+                // Route through MainActivity so the in-app overlay rationale
+                // (system AlertDialog) is shown before Settings.
                 app.startActivity(
-                    PermissionHelper.createOverlayPermissionIntent(app).apply {
-                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    Intent(app, MainActivity::class.java).apply {
+                        action = ACTION_START_PET
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
                     },
                 )
             }
@@ -50,7 +53,6 @@ object PetLauncher {
                 )
             }
             else -> {
-                Analytics.capture(event = "pet started")
                 ContextCompat.startForegroundService(
                     app,
                     Intent(app, PetOverlayService::class.java),

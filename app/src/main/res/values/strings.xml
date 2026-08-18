@@ -31,6 +31,10 @@
     <string name="home_grant_overlay">Allow display over apps</string>
     <string name="home_grant_mic_notif">Allow mic &amp; notifications</string>
     <string name="home_overlay_required">Display-over-apps permission is required to show your pet on screen.</string>
+    <string name="overlay_rationale_title">Display over other apps</string>
+    <string name="overlay_rationale_body">KawaiiPet needs the system “Display over other apps” permission so your pet can stay on screen while you use other apps. Audio is only recorded after you tap the pet. On the next screen, turn the permission on for KawaiiPet.</string>
+    <string name="overlay_rationale_continue">Continue</string>
+    <string name="overlay_rationale_not_now">Not now</string>
     <string name="home_memory">Pet Memory</string>
     <string name="home_usage_reminder">Break reminders</string>
     <string name="usage_reminder_title">Break reminders</string>

@@ -14,14 +14,6 @@ plugins {
     alias(libs.plugins.hilt)
 }
 
-// PostHog keys from repo-root local.properties and/or app/local.properties.
-val localProperties = Properties().apply {
-    rootProject.file("local.properties").takeIf { it.exists() }?.inputStream()?.use { load(it) }
-    project.file("local.properties").takeIf { it.exists() }?.inputStream()?.use { load(it) }
-}
-val posthogApiKeyProp = (localProperties.getProperty("posthog.apiKey") ?: "").replace("\\", "\\\\").replace("\"", "\\\"")
-val posthogHostProp = (localProperties.getProperty("posthog.host") ?: "").replace("\\", "\\\\").replace("\"", "\\\"")
-
 // Optional Play Store / release signing: create keystore.properties at repo root (gitignored) with:
 // storeFile=release.keystore
 // storePassword=...
@@ -70,8 +62,6 @@ android {
         targetSdk = 36
         versionCode = 1
         versionName = "1.0"
-        buildConfigField("String", "POSTHOG_API_KEY", "\"$posthogApiKeyProp\"")
-        buildConfigField("String", "POSTHOG_HOST", "\"$posthogHostProp\"")
         // Pixel / modern phones: skip x86 + armeabi-v7a native libs (~100MB+ APK savings).
         // Emulator: use an arm64 system image, or temporarily add "x86_64".
         ndk {
@@ -222,8 +212,6 @@ dependencies {
     implementation(libs.lottie.compose)
 
     implementation(files(sherpaOnnxAppAarFile.asFile))
-
-    implementation(libs.posthog.android)
 
     // Google LiteRT-LM (on-device chat)
     implementation(libs.litertlm.android)

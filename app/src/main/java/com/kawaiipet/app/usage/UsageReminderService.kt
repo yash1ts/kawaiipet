@@ -15,7 +15,6 @@ import com.kawaiipet.app.KawaiiPetApplication
 import com.kawaiipet.app.R
 import com.kawaiipet.app.overlay.PetOverlayService
 import com.kawaiipet.app.ui.MainActivity
-import com.kawaiipet.app.util.Analytics
 import com.kawaiipet.app.util.PermissionHelper
 import com.kawaiipet.app.util.PreferenceManager
 import dagger.hilt.android.AndroidEntryPoint
@@ -102,14 +101,6 @@ class UsageReminderService : Service() {
                 TAG,
                 "Usage limit hit for ${app.packageName} continuous=${continuousMs / 1000}s limit=${limitMinutes}m",
             )
-            Analytics.capture(
-                event = "usage reminder triggered",
-                properties = mapOf(
-                    "package" to app.packageName,
-                    "limit_minutes" to limitMinutes,
-                    "continuous_seconds" to (continuousMs / 1000L),
-                ),
-            )
             fireNudge(
                 appLabel = app.label.ifBlank { app.packageName },
                 continuousMinutes = ((continuousMs + 30_000L) / 60_000L).toInt().coerceAtLeast(1),
@@ -124,17 +115,8 @@ class UsageReminderService : Service() {
             Log.w(TAG, "Cannot show pet — overlay permission missing")
             return
         }
-        // Leave the watched app so the pet can grab attention on Home.
-        runCatching {
-            startActivity(
-                Intent(Intent.ACTION_MAIN).apply {
-                    addCategory(Intent.CATEGORY_HOME)
-                    flags = Intent.FLAG_ACTIVITY_NEW_TASK
-                },
-            )
-        }.onFailure { e ->
-            Log.w(TAG, "Could not go Home before usage nudge", e)
-        }
+        // Appear over the watched app via TYPE_APPLICATION_OVERLAY. Do not
+        // send the user to Home — that hijacks the foreground app.
         val message = UsageReminderMessages.next(appLabel = appLabel, minutes = continuousMinutes)
         val intent = Intent(this, PetOverlayService::class.java).apply {
             action = PetOverlayService.ACTION_USAGE_NUDGE

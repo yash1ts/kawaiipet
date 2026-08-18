@@ -8,6 +8,7 @@ import android.content.pm.ServiceInfo
 import android.graphics.PixelFormat
 import android.os.Build
 import android.os.IBinder
+import android.provider.Settings
 import android.util.Log
 import android.view.Gravity
 import android.view.View
@@ -30,7 +31,6 @@ import com.kawaiipet.app.pet.PetBrain
 import com.kawaiipet.app.pet.PetViewModel
 import com.kawaiipet.app.ui.AiTriggerActivity
 import com.kawaiipet.app.ui.MainActivity
-import com.kawaiipet.app.util.Analytics
 import com.kawaiipet.app.util.PreferenceManager
 import com.kawaiipet.app.util.UiFeedback
 import dagger.hilt.android.AndroidEntryPoint
@@ -193,22 +193,12 @@ class PetOverlayService : Service() {
     }
 
     private fun foregroundServiceTypes(includeMicrophone: Boolean): Int {
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            var types = ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK or
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
-            if (includeMicrophone) {
-                types = types or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
-            }
-            types
-        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            var types = ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
-            if (includeMicrophone) {
-                types = types or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
-            }
-            types
-        } else {
-            0
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return 0
+        var types = ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
+        if (includeMicrophone) {
+            types = types or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
         }
+        return types
     }
 
     private fun overlayFlags(focusable: Boolean): Int {
@@ -218,6 +208,12 @@ class PetOverlayService : Service() {
     }
 
     private fun attachOverlay() {
+        if (!Settings.canDrawOverlays(this)) {
+            Log.e(TAG, "SYSTEM_ALERT_WINDOW not granted — cannot add overlay")
+            stopSelf()
+            return
+        }
+
         petLayoutParams = WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.WRAP_CONTENT,
@@ -284,9 +280,15 @@ class PetOverlayService : Service() {
             }
         }
 
-        windowManager.addView(petOverlayView, petLayoutParams)
-        chromeOverlayView?.visibility = View.GONE
-        windowManager.addView(chromeOverlayView, chromeLayoutParams)
+        try {
+            windowManager.addView(petOverlayView, petLayoutParams)
+            chromeOverlayView?.visibility = View.GONE
+            windowManager.addView(chromeOverlayView, chromeLayoutParams)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to add TYPE_APPLICATION_OVERLAY windows", e)
+            stopSelf()
+            return
+        }
 
         serviceScope.launch {
             var wasBusy = false
@@ -323,7 +325,7 @@ class PetOverlayService : Service() {
             setViewTreeViewModelStoreOwner(lifecycleOwner)
             setViewTreeSavedStateRegistryOwner(lifecycleOwner)
             setContent {
-                OverlayUsageNudgeScrim(onDismiss = { hideUsageNudgeScrim() })
+                OverlayUsageNudgeScrim()
             }
         }
         val params = WindowManager.LayoutParams(
@@ -331,6 +333,7 @@ class PetOverlayService : Service() {
             WindowManager.LayoutParams.MATCH_PARENT,
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
                 WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
                 WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
             PixelFormat.TRANSLUCENT,
@@ -540,7 +543,6 @@ class PetOverlayService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
-        Analytics.capture(event = "pet stopped")
         serviceJob.cancel()
         AiTriggerActivity.finishIfShowing()
         if (::petViewModel.isInitialized) {

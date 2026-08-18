@@ -3,15 +3,12 @@ package com.kawaiipet.app
 import android.app.Application
 import android.app.NotificationChannel
 import android.app.NotificationManager
-import com.kawaiipet.app.BuildConfig
 import com.kawaiipet.app.audio.VoiceEngineWarmup
 import com.kawaiipet.app.llm.LlmEngineWarmup
 import com.kawaiipet.app.memory.MemoryRepository
 import com.kawaiipet.app.memory.ShortTermMemory
 import com.kawaiipet.app.util.PreferenceManager
 import com.kawaiipet.app.usage.UsageReminderService
-import com.posthog.android.PostHogAndroid
-import com.posthog.android.PostHogAndroidConfig
 import dagger.hilt.android.HiltAndroidApp
 import javax.inject.Inject
 import kotlinx.coroutines.CoroutineScope
@@ -30,11 +27,6 @@ class KawaiiPetApplication : Application() {
 
     override fun onCreate() {
         super.onCreate()
-        val apiKey = BuildConfig.POSTHOG_API_KEY.trim()
-        if (apiKey.isNotEmpty()) {
-            val host = BuildConfig.POSTHOG_HOST.trim().ifEmpty { "https://us.i.posthog.com" }
-            PostHogAndroid.setup(this, PostHogAndroidConfig(apiKey = apiKey, host = host))
-        }
         voiceEngineWarmup.startWarmup()
         llmEngineWarmup.startWarmup("app_start")
         createNotificationChannel()

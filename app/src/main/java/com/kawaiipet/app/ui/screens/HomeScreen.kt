@@ -27,6 +27,7 @@ import androidx.compose.material.icons.outlined.Memory
 import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material.icons.outlined.Timer
 import androidx.compose.material.icons.outlined.Tune
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Icon
@@ -64,7 +65,6 @@ import com.kawaiipet.app.ui.HomeViewModel
 import com.kawaiipet.app.ui.StartPetRequestViewModel
 import com.kawaiipet.app.ui.components.SlimeSvgImage
 import com.kawaiipet.app.ui.navigation.Routes
-import com.kawaiipet.app.util.Analytics
 import com.kawaiipet.app.util.PermissionHelper
 
 @Composable
@@ -88,6 +88,7 @@ fun HomeScreen(
     var hasNotif by remember { mutableStateOf(PermissionHelper.hasNotificationPermission(context)) }
     var pendingStartPet by remember { mutableStateOf(false) }
     var micDeniedAfterPrompt by remember { mutableStateOf(false) }
+    var showOverlayRationale by remember { mutableStateOf(false) }
 
     fun refreshPermissions() {
         hasOverlay = PermissionHelper.hasOverlayPermission(context)
@@ -108,7 +109,6 @@ fun HomeScreen(
     }
 
     fun startPetService() {
-        Analytics.capture(event = "pet started")
         context.startForegroundService(Intent(context, PetOverlayService::class.java))
         startPetRequestViewModel.consumeStartPetRequest()
     }
@@ -121,7 +121,7 @@ fun HomeScreen(
         refreshPermissions()
         return when {
             !hasOverlay -> {
-                context.startActivity(PermissionHelper.createOverlayPermissionIntent(context))
+                showOverlayRationale = true
                 false
             }
             !hasMic || (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && !hasNotif) -> {
@@ -218,6 +218,29 @@ fun HomeScreen(
         !hasMic || (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && !hasNotif) ->
             stringResource(R.string.home_grant_mic_notif)
         else -> stringResource(R.string.home_start_pet)
+    }
+
+    if (showOverlayRationale) {
+        AlertDialog(
+            onDismissRequest = { showOverlayRationale = false },
+            title = { Text(stringResource(R.string.overlay_rationale_title)) },
+            text = { Text(stringResource(R.string.overlay_rationale_body)) },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        showOverlayRationale = false
+                        context.startActivity(PermissionHelper.createOverlayPermissionIntent(context))
+                    },
+                ) {
+                    Text(stringResource(R.string.overlay_rationale_continue))
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showOverlayRationale = false }) {
+                    Text(stringResource(R.string.overlay_rationale_not_now))
+                }
+            },
+        )
     }
 
     Scaffold { padding ->

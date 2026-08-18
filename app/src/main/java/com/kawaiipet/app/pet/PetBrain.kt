@@ -9,7 +9,6 @@ import com.kawaiipet.app.llm.ConversationManager
 import com.kawaiipet.app.llm.LlmEngineWarmup
 import com.kawaiipet.app.llm.LlmPromptDefaults
 import com.kawaiipet.app.tools.AppLauncher
-import com.kawaiipet.app.util.Analytics
 import com.kawaiipet.app.util.DebugSessionLog
 import com.kawaiipet.app.util.PermissionHelper
 import com.kawaiipet.app.util.UiFeedback
@@ -89,16 +88,13 @@ class PetBrain @Inject constructor(
         if (sessionJob?.isActive == true) return
         warmUpLlmInBackground()
         sessionJob = scope.launch {
-            var firstTurn = true
             try {
                 while (isActive) {
-                    val capturedFirst = firstTurn
-                    firstTurn = false
                     var endSession = false
                     val turn = launch {
                         val trace = TurnTrace()
                         try {
-                            when (runOneTurn(firstTurn = capturedFirst, trace = trace)) {
+                            when (runOneTurn(trace = trace)) {
                                 TurnOutcome.EndSession -> endSession = true
                                 TurnOutcome.Continue -> Unit
                             }
@@ -237,7 +233,7 @@ class PetBrain @Inject constructor(
         audioPipeline.release()
     }
 
-    private suspend fun runOneTurn(firstTurn: Boolean, trace: TurnTrace): TurnOutcome {
+    private suspend fun runOneTurn(trace: TurnTrace): TurnOutcome {
         if (!PermissionHelper.hasMicrophonePermission(appContext)) {
             speakError(
                 "Microphone is off for this app. Open KawaiiPet, tap Grant Mic on the home screen, or enable Microphone in Android app settings.",
@@ -267,9 +263,6 @@ class PetBrain @Inject constructor(
             }
         }
 
-        if (firstTurn) {
-            Analytics.capture(event = "voice conversation initiated")
-        }
         _state.value = PetTurnState.Listening
         _listeningSubtitle.value = ""
         _currentResponse.value = ""
@@ -428,17 +421,6 @@ class PetBrain @Inject constructor(
                     )
                     stopMouthAnimation()
                 }
-
-                Analytics.capture(
-                    event = "ai response received",
-                    properties = mapOf(
-                        "expression" to llmResponse.expression.name,
-                        "response_length" to llmResponse.text.length,
-                        "streamed_speech" to queuedTts.get(),
-                        "tool_app" to (llmResponse.toolCall?.intent?.id ?: ""),
-                        "tool_query" to (llmResponse.toolCall?.query ?: ""),
-                    ),
-                )
 
                 // Open/play after speech so the confirmation is heard first.
                 llmResponse.toolCall?.let { call ->
