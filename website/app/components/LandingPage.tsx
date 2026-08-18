@@ -246,6 +246,9 @@ export function LandingPage({ apkHref, githubUrl }: LandingPageProps) {
             <Link href="/privacy" className="text-slate-600 transition-colors hover:text-slate-900">
               Privacy
             </Link>
+            <Link href="/terms" className="text-slate-600 transition-colors hover:text-slate-900">
+              Terms
+            </Link>
             {githubUrl ? (
               <a
                 href={githubUrl}
